@@ -69,7 +69,7 @@ for i in 1 2 3; do J=$(sbatch --parsable --dependency=afterany:$J submit_train_p
 **整晚生成 50 Hz PPG 并检查质量（`ppg_generation.py`、`scripts/generate_ppg_nights.py`、`scripts/plot_ppg_quality.py`、`submit_generate_ppg_nights.sh`）：**
 
 - 每个人的每个 30 秒 epoch 独立生成（与 IBI 整晚生成相同的做法），条件用这个人真实的睡眠分期、AHI/BMI/AGE/性别和逐点呼吸事件。
-- **默认只生成 PPG 并比较质量，不转 IBI。** 生成和真实的每个窗口都升到 100 Hz、`nk.ppg_clean` 后算：`nk.ppg_quality` 的 `templatematch`（越接近 1 越好）和 `disimilarity`（越小越好）、偏度和峰度（Elgendi 2016，偏度是最好的单项 PPG 质量指标）、1–2.25 Hz 占 0–8 Hz 的功率比、30 秒内的心跳数。每人给出生成与真实的中位数、W1、KS、`templatematch` 低于 0.9/0.8 的比例，以及按睡眠分期的结果。默认不做重新生成（看模型的原始输出）；`--quality-threshold 0.8` 可让 SQI 低的窗口重新生成。
+- **默认只生成 PPG 并比较质量，不转 IBI。** 生成和真实的每个窗口先统一尺度（减中位数、除以 1–99% 范围的一半；生成的是归一化单位，真实的是 E4 原始幅度，而 `disimilarity` 随幅度变化），再升到 100 Hz、`nk.ppg_clean` 后算：`nk.ppg_quality` 的 `templatematch`（越接近 1 越好）和 `disimilarity`（越小越好）、偏度和峰度（Elgendi 2016，偏度是最好的单项 PPG 质量指标）、1–2.25 Hz 占 0–8 Hz 的功率比、30 秒内的心跳数。每人给出生成与真实的中位数、W1、KS、`templatematch` 低于 0.9/0.8 的比例，以及按睡眠分期的结果。默认不做重新生成（看模型的原始输出）；`--quality-threshold 0.8` 可让 SQI 低的窗口重新生成。
 - **`--ibi`：** 另外把每个窗口单独转成 25 Hz IBI（真实 PPG 同样处理）、做呼吸事件的对照生成（同一噪声，事件通道全 0），并写出 WatchSleepNet 格式的 `night_npz/`、`night_npz_real/`。
 - 检查点先复制到输出文件夹再使用（训练继续更新 `best.pt` 也不会混用两个模型）；重交同一命令会接着做没完成的人。训练现在每 10 个 epoch 另存 `checkpoints/epoch_XXX.pt`。
 

@@ -4,8 +4,10 @@ For every participant, each stored 30-s epoch is generated independently (as in 
 window per epoch, stitched into the night) from the participant's real conditions: sleep stage,
 AHI/BMI/AGE/gender and the per-sample respiratory-event flags.
 
-PPG quality (the comparison asked for before any IBI): every generated and every real window is resampled
-to 100 Hz, cleaned with nk.ppg_clean (Elgendi) and its beats found as in ppg_extraction; then
+PPG quality (the comparison asked for before any IBI): every generated and every real window is first put
+on the same scale (minus its median, divided by half its 1-99 % range; generated PPG is in normalized units,
+real PPG in raw E4 units, and neurokit2's disimilarity depends on amplitude), resampled to 100 Hz, cleaned
+with nk.ppg_clean (Elgendi) and its beats found as in ppg_extraction; then
   templatematch, disimilarity  nk.ppg_quality (the two methods of neurokit2 0.2.12), window mean;
   skewness, kurtosis           of the cleaned window (Elgendi 2016: skewness is the best single PPG SQI);
   relative_power               power 1-2.25 Hz / power 0-8 Hz of the cleaned window (Elgendi 2016);
@@ -33,7 +35,7 @@ import numpy as np
 import ppg_extraction as px
 import ppg_training as pt
 
-SCHEMA = "ppg50_night_generation_v1"
+SCHEMA = "ppg50_night_generation_v2"
 STAGE_MAPPING = dict(W=0, N1=1, N2=2, Deep=3, REM=4)            # codes of the extraction (and night NPZ)
 STAGE_GROUPS = dict(W=(0,), Light=(1, 2), REM=(4,), Deep=(3,))
 
@@ -96,7 +98,13 @@ def _window_quality(window):
     from scipy.signal import welch
     from scipy.stats import kurtosis, skew
 
-    x = px.resample_to(np.asarray(window, dtype=np.float64), pt.FS, px.FS_DETECT)
+    window = np.asarray(window, dtype=np.float64)
+    # same scale for generated (normalized units) and real (raw E4 units) windows: neurokit2's
+    # disimilarity grows with amplitude (x10 amplitude: 0.010 -> 0.086), the other measures do not
+    low, high = np.percentile(window, [1.0, 99.0])
+    scale = (high - low) / 2.0
+    window = (window - np.median(window)) / scale if np.isfinite(scale) and scale > 1e-12 else window * 0.0
+    x = px.resample_to(window, pt.FS, px.FS_DETECT)
     cleaned, peaks = px.ppg_peaks(x, px.FS_DETECT)
     row = dict.fromkeys(QUALITY_MEASURES, np.nan)
     row["beats"] = float(peaks.size)
@@ -231,7 +239,7 @@ def generate_subject(sid, cohort, model, schedule, device, options):
     quality_real = quality_measures(record["ppg"], workers)
     events25 = record["apnea"][:, ::2]                                   # 50 Hz -> 25 Hz samples
 
-    metrics = dict(subject=sid, epochs=int(n), checkpoint_epoch=options.get("checkpoint_epoch"),
+    metrics = dict(schema=SCHEMA, subject=sid, epochs=int(n), checkpoint_epoch=options.get("checkpoint_epoch"),
                    quality_threshold=options["quality_threshold"], max_retries=options["max_retries"],
                    ibi=bool(options.get("ibi")), quality=compare_quality(quality_gen, quality_real),
                    retried_epochs=float((attempts > 1).mean()), mean_attempts=float(attempts.mean()),

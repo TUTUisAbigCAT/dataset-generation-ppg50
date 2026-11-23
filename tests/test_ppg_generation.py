@@ -80,6 +80,9 @@ class NightGenerationTests(unittest.TestCase):
         self.assertTrue(np.all(q_clean["beats"] >= 30))
         parallel = pg.quality_measures(np.tile(clean, (6, 1)), workers=3)
         np.testing.assert_allclose(parallel["templatematch"][:4], q_clean["templatematch"])
+        scaled = pg.quality_measures(clean * 300.0)                               # raw E4-like amplitude
+        for measure in pg.QUALITY_MEASURES:
+            np.testing.assert_allclose(scaled[measure], q_clean[measure], rtol=1e-6, err_msg=measure)
         same = pg.compare_quality(q_clean, q_clean)
         self.assertEqual(same["templatematch"]["w1"], 0.0)
         self.assertEqual(same["templatematch_below_0.8"]["gen"], 0.0)

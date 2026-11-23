@@ -205,7 +205,8 @@ def main(argv=None):
         meta_path = output / "subjects" / f"{sid}.json"
         if meta_path.is_file():
             stored = json.loads(meta_path.read_text(encoding="utf-8"))
-            if stored.get("status") == "written" and stored.get("checkpoint_sha256") == manifest["checkpoint"]["sha256"]:
+            if (stored.get("status") == "written" and stored.get("schema") == pg.SCHEMA
+                    and stored.get("checkpoint_sha256") == manifest["checkpoint"]["sha256"]):
                 rows[sid] = flat_row(stored, dict(extra, status="kept_existing", epochs=stored.get("epochs"),
                                                   seconds=stored.get("seconds")))
                 continue
