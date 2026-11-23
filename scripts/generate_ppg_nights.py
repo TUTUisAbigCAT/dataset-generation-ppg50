@@ -1,22 +1,24 @@
-r"""Generate whole-night 50 Hz PPG for every participant with a trained PPG model (see ppg_generation.py).
+r"""Generate whole-night 50 Hz PPG for every participant and compare its quality with the real PPG.
 
   python scripts/generate_ppg_nights.py --run RUN_DIR [--checkpoint best.pt] --output-dir OUT
   python scripts/generate_ppg_nights.py --run RUN_DIR --output-dir OUT --check-only
+  ... --ibi          also derive IBI (each window on its own), the event counterfactual and night NPZ files
+  ... --quality-threshold 0.8   regenerate windows whose template SQI is below 0.8 (off by default)
 
 The checkpoint is copied into OUT/checkpoint.pt first and only that copy is used, so a training job that
 keeps updating best.pt cannot mix two models in one output. Rerunning the same command continues
 (participants already written with this checkpoint and these options are kept).
 
 OUT/
-  generation.json            checkpoint (source, epoch, sha256, its validation metrics) and options
-  subjects/<SID>.npz         generated PPG [n, 1500], SQI per epoch (final and first attempt), attempts,
-                             generated and real IBI [n, 750] (each window on its own), stages, events,
-                             counterfactual windows (events vs events zeroed, same noise)
-  subjects/<SID>.json        metrics: IBI W1/mean/SD generated vs real (overall and by stage), SQI and
-                             retries, event contrasts, counterfactual effect
-  night_npz/<SID>.npz        generated night, DREAMT/WatchSleepNet format (data [N, 1] s at 25 Hz, stages)
-  night_npz_real/<SID>.npz   real night processed the same way (each window on its own)
+  generation.json          checkpoint (source, epoch, sha256, its validation metrics) and options
+  subjects/<SID>.npz       generated PPG [n, 1500] and per-window quality of generated and real PPG
+                           (templatematch, disimilarity, skewness, kurtosis, relative_power, beats),
+                           stages, events; with --ibi also IBI and the counterfactual windows
+  subjects/<SID>.json      quality comparison (medians, W1, KS, share below templatematch 0.9/0.8,
+                           by stage); with --ibi also IBI metrics and event effects
+  night_npz/, night_npz_real/   (--ibi only) generated and real nights in the WatchSleepNet NPZ format
   subjects_summary.csv, summary.json
+Plot: python scripts/plot_ppg_quality.py OUT
 """
 from __future__ import annotations
 
@@ -41,8 +43,14 @@ import numpy as np
 import ppg_generation as pg
 import ppg_training as pt
 
-OPTION_KEYS = ("seed", "quality_threshold", "max_retries", "counterfactual_windows")
-CSV_FIELDS = ("subject", "status", "epochs", "validation_subject", "ecg_irregular", "lag_median_s",
+OPTION_KEYS = ("seed", "quality_threshold", "max_retries", "counterfactual_windows", "ibi")
+QUALITY_FIELDS = tuple(f"{m}_{k}" for m in ("templatematch", "disimilarity", "skewness", "kurtosis", "relative_power",
+                                             "beats") for k in ("median_gen", "median_real", "w1", "ks")) + (
+    "templatematch_below_0.9_gen", "templatematch_below_0.9_real", "templatematch_below_0.8_gen",
+    "templatematch_below_0.8_real", "W_templatematch_median_gen", "W_templatematch_median_real",
+    "Light_templatematch_median_gen", "Light_templatematch_median_real", "REM_templatematch_median_gen",
+    "REM_templatematch_median_real", "Deep_templatematch_median_gen", "Deep_templatematch_median_real")
+CSV_FIELDS = ("subject", "status", "epochs", "validation_subject", "ecg_irregular", "lag_median_s") + QUALITY_FIELDS + (
               "w1_ms", "mean_gen_ms", "mean_real_ms", "sd_gen_ms", "sd_real_ms",
               "valid_fraction_gen", "valid_fraction_real", "beats_per_epoch_gen", "beats_per_epoch_real",
               "sqi_median_gen", "sqi_median_real", "sqi_below_threshold_first_attempt", "sqi_below_threshold_final",
@@ -63,8 +71,12 @@ def parse_args(argv=None):
     parser.add_argument("--subjects", nargs="*", default=None)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=20261123)
-    parser.add_argument("--quality-threshold", type=float, default=0.8,
-                        help="regenerate windows whose SQI is below this (0 = no quality check)")
+    parser.add_argument("--quality-threshold", type=float, default=0.0,
+                        help="regenerate windows whose template SQI is below this (default 0 = keep the raw output)")
+    parser.add_argument("--ibi", action="store_true",
+                        help="also derive IBI, the event counterfactual and night NPZ files")
+    parser.add_argument("--quality-workers", type=int, default=min(12, os.cpu_count() or 1),
+                        help="processes for the quality measures")
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--counterfactual-windows", type=int, default=64,
                         help="windows with events generated again with the event channel zeroed")
@@ -83,8 +95,16 @@ def flat_row(metrics, extra):
     row = dict(extra)
     if metrics:
         row.update({k: metrics.get(k) for k in CSV_FIELDS if k in metrics and not isinstance(metrics.get(k), dict)})
-        row.update({k: metrics["overall"].get(k) for k in ("w1_ms", "mean_gen_ms", "mean_real_ms", "sd_gen_ms",
-                                                         "sd_real_ms")})
+        for measure, values in (metrics.get("quality") or {}).items():
+            if measure.startswith("templatematch_below_"):
+                row[f"{measure}_gen"], row[f"{measure}_real"] = values["gen"], values["real"]
+            else:
+                row.update({f"{measure}_{k}": values.get(k) for k in ("median_gen", "median_real", "w1", "ks")})
+        for stage, values in (metrics.get("quality_by_stage") or {}).items():
+            for side in ("gen", "real"):
+                row[f"{stage}_templatematch_median_{side}"] = values.get(f"templatematch_median_{side}")
+        row.update({k: (metrics.get("overall") or {}).get(k) for k in ("w1_ms", "mean_gen_ms", "mean_real_ms",
+                                                                       "sd_gen_ms", "sd_real_ms")})
         for stage, values in metrics.get("by_stage", {}).items():
             row[f"{stage}_w1_ms"] = values.get("w1_ms")
             row[f"{stage}_mean_gen_ms"] = values.get("mean_gen_ms")
@@ -130,12 +150,12 @@ def main(argv=None):
         source = run / source if (run / source).exists() else source.resolve()
     output = cli.output_dir.expanduser().resolve()
     options = dict(seed=cli.seed, quality_threshold=cli.quality_threshold, max_retries=cli.max_retries,
-                   counterfactual_windows=cli.counterfactual_windows)
+                   counterfactual_windows=cli.counterfactual_windows, ibi=bool(cli.ibi))
     manifest_path = output / "generation.json"
     frozen = output / "checkpoint.pt"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if {k: manifest["options"][k] for k in OPTION_KEYS} != options:
+        if {k: manifest["options"].get(k) for k in OPTION_KEYS} != options:
             raise SystemExit(f"{output} was generated with other options {manifest['options']}; use a new --output-dir")
         if pg.sha256_file(frozen) != manifest["checkpoint"]["sha256"]:
             raise SystemExit(f"{frozen} changed since the first run; use a new --output-dir")
@@ -167,7 +187,7 @@ def main(argv=None):
         return dict(status="checked", **info)
     if device.type != "cuda" and not cli.allow_cpu:
         raise SystemExit("CUDA is required (use --allow-cpu only for tests)")
-    for folder in ("subjects", "night_npz", "night_npz_real"):
+    for folder in ("subjects",) + (("night_npz", "night_npz_real") if cli.ibi else ()):
         (output / folder).mkdir(parents=True, exist_ok=True)
     if manifest is None:
         shutil.copy2(source, frozen)
@@ -199,16 +219,18 @@ def main(argv=None):
         try:
             arrays, metrics = pg.generate_subject(sid, cohort, model, schedule, device,
                                                   dict(options, batch_size=cli.batch_size,
-                                                       checkpoint_epoch=weights.get("epoch")))
+                                                       checkpoint_epoch=weights.get("epoch"),
+                                                       quality_workers=cli.quality_workers))
             record = cohort.records[sid]
             ahi = float(record["continuous"][0])
             save_npz(output / "subjects" / f"{sid}.npz", arrays)
-            save_npz(output / "night_npz" / f"{sid}.npz",
-                     pg.night_arrays(arrays["ibi_generated"], record, ahi, synthetic=True,
-                                     epoch_start_s=record.get("epoch_start_s")))
-            save_npz(output / "night_npz_real" / f"{sid}.npz",
-                     pg.night_arrays(arrays["ibi_real_windowed"], record, ahi, synthetic=False,
-                                     epoch_start_s=record.get("epoch_start_s")))
+            if cli.ibi:
+                save_npz(output / "night_npz" / f"{sid}.npz",
+                         pg.night_arrays(arrays["ibi_generated"], record, ahi, synthetic=True,
+                                         epoch_start_s=record.get("epoch_start_s")))
+                save_npz(output / "night_npz_real" / f"{sid}.npz",
+                         pg.night_arrays(arrays["ibi_real_windowed"], record, ahi, synthetic=False,
+                                         epoch_start_s=record.get("epoch_start_s")))
             seconds = round(time.time() - t0, 1)
             metrics.update(status="written", seconds=seconds, checkpoint_sha256=manifest["checkpoint"]["sha256"])
             meta_path.write_text(json.dumps(metrics, indent=2, default=float), encoding="utf-8")
@@ -219,16 +241,19 @@ def main(argv=None):
             rows[sid] = dict(extra, status="failed", error=str(error))
             print(traceback.format_exc(), file=sys.stderr, flush=True)
         r = rows[sid]
-        print(json.dumps({k: r.get(k) for k in ("subject", "status", "epochs", "w1_ms", "mean_gen_ms", "mean_real_ms",
-                                                 "sqi_below_threshold_first_attempt", "sqi_below_threshold_final",
-                                                 "counterfactual_ibi_change_event_samples_ms", "seconds", "error")},
+        print(json.dumps({k: r.get(k) for k in ("subject", "status", "epochs", "templatematch_median_gen",
+                                                 "templatematch_median_real", "templatematch_below_0.8_gen",
+                                                 "templatematch_below_0.8_real", "skewness_median_gen",
+                                                 "skewness_median_real", "w1_ms", "seconds", "error")},
                          default=float), flush=True)
         write_summary(output, rows)
     summary = write_summary(output, rows)
     remaining = [s for s in subjects if s not in rows]
     status = "completed" if not remaining and not summary["failed"] else ("paused" if remaining else "completed_with_failures")
     print(json.dumps(dict(event="done", status=status, written=summary["written"], failed=summary["failed"],
-                          remaining=len(remaining), median_w1_ms=summary["median"].get("w1_ms"),
+                          remaining=len(remaining),
+                          templatematch_median_gen=summary["median"].get("templatematch_median_gen"),
+                          templatematch_median_real=summary["median"].get("templatematch_median_real"),
                           output_directory=str(output)), default=float), flush=True)
     return dict(status=status, summary=summary)
 

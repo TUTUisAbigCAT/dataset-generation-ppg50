@@ -4,7 +4,8 @@
 #SBATCH --time=04:00:00
 #SBATCH --job-name=gen-ppg50
 #SBATCH --output=/home/yxtao/links/scratch/dataset-generation/logs/gen_ppg50_%j.txt
-# Whole-night 50 Hz PPG for every participant (GPU; submit from trig-login01).
+# Whole-night 50 Hz PPG for every participant and its quality vs the real PPG (GPU; trig-login01).
+# Add IBI etc. later with EXTRA="--ibi" (a new LABEL/output folder).
 # Run from /project/def-plago/yxtao/dataset-generation-ppg50:
 #   sbatch submit_generate_ppg_nights.sh RUN_DIR [LABEL]
 #   CHECKPOINT=checkpoints/epoch_050.pt sbatch submit_generate_ppg_nights.sh RUN_DIR e050
@@ -31,6 +32,8 @@ fi
 LABEL="${2:-${LABEL:-best}}"
 CHECKPOINT="${CHECKPOINT:-best.pt}"
 OUT="${OUT:-/home/yxtao/links/scratch/dataset-generation-ppg50/nights/$(basename "$RUN")_${LABEL}}"
+# shellcheck disable=SC2086
 python -B -u scripts/generate_ppg_nights.py --run "$RUN" --checkpoint "$CHECKPOINT" --output-dir "$OUT" \
-  --max-hours "${MAX_HOURS:-3.6}"
-echo "nights: $OUT  (summary: $OUT/subjects_summary.csv)"
+  --max-hours "${MAX_HOURS:-3.6}" --quality-workers "$(nproc)" ${EXTRA:-}
+python -B scripts/plot_ppg_quality.py "$OUT" || true
+echo "nights: $OUT  (summary: $OUT/subjects_summary.csv, figure: $OUT/quality_comparison.png)"

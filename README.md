@@ -66,19 +66,18 @@ J=$(sbatch --parsable submit_train_ppg.sh); R=/home/yxtao/links/scratch/dataset-
 for i in 1 2 3; do J=$(sbatch --parsable --dependency=afterany:$J submit_train_ppg.sh $R); done
 ```
 
-**整晚生成 50 Hz PPG（`ppg_generation.py`、`scripts/generate_ppg_nights.py`、`submit_generate_ppg_nights.sh`）：**
+**整晚生成 50 Hz PPG 并检查质量（`ppg_generation.py`、`scripts/generate_ppg_nights.py`、`scripts/plot_ppg_quality.py`、`submit_generate_ppg_nights.sh`）：**
 
 - 每个人的每个 30 秒 epoch 独立生成（与 IBI 整晚生成相同的做法），条件用这个人真实的睡眠分期、AHI/BMI/AGE/性别和逐点呼吸事件。
-- **质量检测：** 每个生成窗口都用和真实 PPG 相同的模板相关 SQI 检查，低于 0.8 的换新噪声重新生成，最多 3 次，保留 SQI 最高的一次；每个窗口的最终 SQI、第一次的 SQI 和尝试次数都保存下来（`--quality-threshold 0` 关闭）。
-- **IBI：** 窗口是独立生成的，接缝两侧的间期没有意义，所以每个窗口单独走 `ppg_to_ibi`；真实 PPG 也用完全相同的方式处理后再比较。
-- **呼吸事件检查：** 每人取 64 个含事件的窗口，同一噪声下分别用真实事件和全 0 事件生成，比较 IBI 变化；另外给出真实和生成整晚“事件中减事件外”的窗口内 IBI 差。
+- **默认只生成 PPG 并比较质量，不转 IBI。** 生成和真实的每个窗口都升到 100 Hz、`nk.ppg_clean` 后算：`nk.ppg_quality` 的 `templatematch`（越接近 1 越好）和 `disimilarity`（越小越好）、偏度和峰度（Elgendi 2016，偏度是最好的单项 PPG 质量指标）、1–2.25 Hz 占 0–8 Hz 的功率比、30 秒内的心跳数。每人给出生成与真实的中位数、W1、KS、`templatematch` 低于 0.9/0.8 的比例，以及按睡眠分期的结果。默认不做重新生成（看模型的原始输出）；`--quality-threshold 0.8` 可让 SQI 低的窗口重新生成。
+- **`--ibi`：** 另外把每个窗口单独转成 25 Hz IBI（真实 PPG 同样处理）、做呼吸事件的对照生成（同一噪声，事件通道全 0），并写出 WatchSleepNet 格式的 `night_npz/`、`night_npz_real/`。
 - 检查点先复制到输出文件夹再使用（训练继续更新 `best.pt` 也不会混用两个模型）；重交同一命令会接着做没完成的人。训练现在每 10 个 epoch 另存 `checkpoints/epoch_XXX.pt`。
-- 输出：`subjects/<SID>.npz/.json`（生成 PPG、SQI、IBI、指标）、`night_npz/<SID>.npz`（生成整晚，WatchSleepNet 格式：`data [N,1]` 秒、25 Hz、逐点 `stages`、`ahi`、`apnea`）、`night_npz_real/<SID>.npz`（真实整晚，同样处理）、`subjects_summary.csv`、`summary.json`。
 
 ```bash
 python -B scripts/generate_ppg_nights.py --run RUN_DIR --output-dir OUT --check-only      # 登录节点
-sbatch submit_generate_ppg_nights.sh RUN_DIR [LABEL]                                     # 默认 best.pt
-CHECKPOINT=checkpoints/epoch_050.pt sbatch submit_generate_ppg_nights.sh RUN_DIR e050    # 指定 epoch
+sbatch submit_generate_ppg_nights.sh RUN_DIR [LABEL]                                     # 默认 best.pt，只做质量
+CHECKPOINT=epoch050.pt sbatch submit_generate_ppg_nights.sh RUN_DIR e050                 # 指定检查点
+python scripts/plot_ppg_quality.py OUT                                                   # -> OUT/quality_comparison.png
 ```
 
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）

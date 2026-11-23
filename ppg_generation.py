@@ -4,18 +4,22 @@ For every participant, each stored 30-s epoch is generated independently (as in 
 window per epoch, stitched into the night) from the participant's real conditions: sleep stage,
 AHI/BMI/AGE/gender and the per-sample respiratory-event flags.
 
-Quality check (the supervisor's request for generated PPG): every generated window goes through the
-same template-matching SQI as real PPG; windows below `quality_threshold` are generated again with new
-noise, up to `max_retries` times, and the attempt with the highest SQI is kept. Per-window SQI and the
-number of attempts are stored, so the effect of the check is visible.
+PPG quality (the comparison asked for before any IBI): every generated and every real window is resampled
+to 100 Hz, cleaned with nk.ppg_clean (Elgendi) and its beats found as in ppg_extraction; then
+  templatematch, disimilarity  nk.ppg_quality (the two methods of neurokit2 0.2.12), window mean;
+  skewness, kurtosis           of the cleaned window (Elgendi 2016: skewness is the best single PPG SQI);
+  relative_power               power 1-2.25 Hz / power 0-8 Hz of the cleaned window (Elgendi 2016);
+  beats                        detected beats in the 30-s window.
+Generated and real distributions are compared per participant, overall and by sleep stage.
 
-IBI: windows are generated independently, so the interval across a seam between two windows has no
-meaning; each window therefore goes through ppg_extraction.ppg_to_ibi on its own (WatchSleepNet 25 Hz
-format), and the real PPG is processed exactly the same way for the comparison.
+Optional regeneration (`quality_threshold` > 0): windows whose template SQI is below the threshold are
+generated again with new noise up to `max_retries` times, keeping the best attempt. Off by default, so the
+quality check sees the model's raw output.
 
-Respiratory events: a counterfactual on windows that contain events (same noise, event channel zeroed)
-shows whether the model reacts to the event condition; the within-window IBI contrast (event samples
-minus other samples) is reported for real and generated nights.
+Optional IBI (`ibi`): windows are generated independently, so the interval across a seam has no meaning;
+each window goes through ppg_extraction.ppg_to_ibi on its own (WatchSleepNet 25 Hz format) and the real
+PPG is processed the same way. With IBI also come the respiratory-event counterfactual (same noise,
+event channel zeroed), the within-window event contrast and the night NPZ files.
 """
 from __future__ import annotations
 
@@ -81,6 +85,83 @@ def windowed(windows):
     return result["ibi"], result["status"], result["sqi"], result["beats_per_epoch"]
 
 
+QUALITY_MEASURES = ("templatematch", "disimilarity", "skewness", "kurtosis", "relative_power", "beats")
+HIGHER_IS_BETTER = dict(templatematch=True, disimilarity=False, relative_power=True)
+
+
+def _window_quality(window):
+    import warnings
+
+    import neurokit2 as nk
+    from scipy.signal import welch
+    from scipy.stats import kurtosis, skew
+
+    x = px.resample_to(np.asarray(window, dtype=np.float64), pt.FS, px.FS_DETECT)
+    cleaned, peaks = px.ppg_peaks(x, px.FS_DETECT)
+    row = dict.fromkeys(QUALITY_MEASURES, np.nan)
+    row["beats"] = float(peaks.size)
+    if not np.isfinite(cleaned).all() or np.std(cleaned) <= 1e-12:
+        return row
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if peaks.size >= 3:
+            # neurokit2 0.2.12 spells the second method "disimilarity", 0.3 "dissimilarity"
+            for key, names in (("templatematch", ("templatematch",)), ("disimilarity", ("disimilarity", "dissimilarity"))):
+                for method in names:
+                    try:
+                        row[key] = float(np.nanmean(nk.ppg_quality(cleaned, peaks, sampling_rate=px.FS_DETECT,
+                                                                   method=method)))
+                        break
+                    except Exception:
+                        continue
+        row["skewness"] = float(skew(cleaned))
+        row["kurtosis"] = float(kurtosis(cleaned))
+        freqs, power = welch(cleaned, fs=px.FS_DETECT, nperseg=min(1000, cleaned.size))
+        total = power[(freqs >= 0) & (freqs <= 8)].sum()
+        row["relative_power"] = float(power[(freqs >= 1) & (freqs <= 2.25)].sum() / total) if total > 0 else np.nan
+    return row
+
+
+def _quality_chunk(windows):
+    return [_window_quality(w) for w in windows]
+
+
+def quality_measures(windows, workers=1):
+    """dict measure -> array [N] for windows [N, 1500] (50 Hz); see the module docstring."""
+    windows = np.asarray(windows, dtype=np.float32)
+    if workers > 1 and len(windows) > 16:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        chunks = np.array_split(windows, min(len(windows), workers * 4))
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("fork")) as pool:
+            rows = [r for part in pool.map(_quality_chunk, chunks) for r in part]
+    else:
+        rows = _quality_chunk(windows)
+    return {m: np.array([r[m] for r in rows], dtype=np.float64) for m in QUALITY_MEASURES}
+
+
+def compare_quality(generated, real):
+    """Per measure: medians, W1 and KS between generated and real window values."""
+    from scipy.stats import ks_2samp, wasserstein_distance
+
+    out = {}
+    for m in QUALITY_MEASURES:
+        g, r = generated[m][np.isfinite(generated[m])], real[m][np.isfinite(real[m])]
+        if not g.size or not r.size:
+            out[m] = dict(median_gen=None, median_real=None, w1=None, ks=None)
+            continue
+        out[m] = dict(median_gen=float(np.median(g)), median_real=float(np.median(r)),
+                      p10_gen=float(np.quantile(g, 0.1)), p10_real=float(np.quantile(r, 0.1)),
+                      w1=float(wasserstein_distance(g, r)), ks=float(ks_2samp(g, r).statistic),
+                      missing_gen=float(1 - g.size / generated[m].size), missing_real=float(1 - r.size / real[m].size))
+    for threshold in (0.9, 0.8):
+        out[f"templatematch_below_{threshold}"] = dict(
+            gen=float(np.mean(~(generated["templatematch"] >= threshold))),
+            real=float(np.mean(~(real["templatematch"] >= threshold))))
+    return out
+
+
 def generate_with_quality(model, conditions, schedule, device, generator, *, batch_size, threshold, max_retries):
     """Generate windows; regenerate those with SQI below threshold, keeping each window's best attempt."""
     ppg = generate_windows(model, conditions, schedule, device, generator, batch_size)
@@ -137,23 +218,57 @@ def generate_subject(sid, cohort, model, schedule, device, options):
     n = record["stages"].size
     conditions = np.stack([cohort.window_array(sid, k) for k in range(n)])
     generator = torch.Generator().manual_seed(subject_seed(options["seed"], sid))
-    ppg, sqi, first_sqi, attempts = generate_with_quality(
-        model, conditions, schedule, device, generator, batch_size=options["batch_size"],
-        threshold=options["quality_threshold"], max_retries=options["max_retries"])
-    ibi_gen, status_gen, _, beats_gen = windowed(ppg)
-    ibi_real, status_real, sqi_real, beats_real = windowed(record["ppg"])
+    if options["quality_threshold"] > 0:
+        ppg, sqi, first_sqi, attempts = generate_with_quality(
+            model, conditions, schedule, device, generator, batch_size=options["batch_size"],
+            threshold=options["quality_threshold"], max_retries=options["max_retries"])
+    else:
+        ppg = generate_windows(model, conditions, schedule, device, generator, options["batch_size"])
+        sqi = first_sqi = None
+        attempts = np.ones(n, dtype=np.int16)
+    workers = options.get("quality_workers", 1)
+    quality_gen = quality_measures(ppg, workers)
+    quality_real = quality_measures(record["ppg"], workers)
     events25 = record["apnea"][:, ::2]                                   # 50 Hz -> 25 Hz samples
 
     metrics = dict(subject=sid, epochs=int(n), checkpoint_epoch=options.get("checkpoint_epoch"),
                    quality_threshold=options["quality_threshold"], max_retries=options["max_retries"],
-                   overall=ibi_comparison(ibi_gen, ibi_real),
+                   ibi=bool(options.get("ibi")), quality=compare_quality(quality_gen, quality_real),
+                   retried_epochs=float((attempts > 1).mean()), mean_attempts=float(attempts.mean()),
+                   quality_by_stage={})
+    for name, codes in STAGE_GROUPS.items():
+        rows = np.isin(record["stages"], codes)
+        if rows.any():
+            metrics["quality_by_stage"][name] = dict(epochs=int(rows.sum()), **{
+                f"{m}_median_{side}": (float(np.nanmedian(values[m][rows])) if np.isfinite(values[m][rows]).any()
+                                       else None)
+                for m in ("templatematch", "skewness", "relative_power")
+                for side, values in (("gen", quality_gen), ("real", quality_real))})
+    arrays = dict(schema=np.array(SCHEMA), subject=np.array(sid), generated_ppg=ppg, attempts=attempts,
+                  stages=record["stages"].astype(np.int8), epoch_index=record["epoch_index"],
+                  epoch_ok=record["epoch_ok"], apnea_25hz=events25.astype(np.uint8),
+                  **{f"quality_gen_{m}": v.astype(np.float32) for m, v in quality_gen.items()},
+                  **{f"quality_real_{m}": v.astype(np.float32) for m, v in quality_real.items()})
+    if sqi is not None:
+        arrays.update(sqi_generated=sqi.astype(np.float32), sqi_first_attempt=first_sqi.astype(np.float32))
+        metrics.update(sqi_below_threshold_first_attempt=float((first_sqi < options["quality_threshold"]).mean()),
+                       sqi_below_threshold_final=float((sqi < options["quality_threshold"]).mean()))
+    if options.get("ibi"):
+        arrays_ibi, metrics_ibi = _ibi_part(sid, record, conditions, ppg, events25, model, schedule, device, options)
+        arrays.update(arrays_ibi)
+        metrics.update(metrics_ibi)
+    arrays["metrics"] = np.array(json.dumps(metrics, default=float))
+    return arrays, metrics
+
+
+def _ibi_part(sid, record, conditions, ppg, events25, model, schedule, device, options):
+    import torch
+
+    ibi_gen, status_gen, _, beats_gen = windowed(ppg)
+    ibi_real, status_real, _, beats_real = windowed(record["ppg"])
+    metrics = dict(overall=ibi_comparison(ibi_gen, ibi_real),
                    valid_fraction_gen=float((ibi_gen > 0).mean()), valid_fraction_real=float((ibi_real > 0).mean()),
                    beats_per_epoch_gen=float(beats_gen.mean()), beats_per_epoch_real=float(beats_real.mean()),
-                   sqi_median_gen=float(np.median(sqi)), sqi_median_real=float(np.median(sqi_real)),
-                   sqi_below_threshold_first_attempt=float((first_sqi < options["quality_threshold"]).mean()),
-                   sqi_below_threshold_final=float((sqi < options["quality_threshold"]).mean()),
-                   sqi_below_threshold_real=float((sqi_real < options["quality_threshold"]).mean()),
-                   retried_epochs=float((attempts > 1).mean()), mean_attempts=float(attempts.mean()),
                    by_stage={})
     for name, codes in STAGE_GROUPS.items():
         rows = np.isin(record["stages"], codes)
@@ -164,9 +279,9 @@ def generate_subject(sid, cohort, model, schedule, device, options):
     metrics["events"] = dict(event_sample_fraction=float(events25.mean()),
                              within_window_contrast_real_ms=contrast_real, contrast_windows_real=windows_real,
                              within_window_contrast_gen_ms=contrast_gen, contrast_windows_gen=windows_gen)
-
+    arrays = dict(ibi_generated=ibi_gen.astype(np.float32), ibi_generated_status=status_gen,
+                  ibi_real_windowed=ibi_real.astype(np.float32), ibi_real_status=status_real)
     chosen = counterfactual_windows(record["apnea"], options["counterfactual_windows"])
-    counterfactual = {}
     if chosen.size:
         zeroed = conditions[chosen].copy()
         zeroed[:, :, -1] = 0.0
@@ -180,8 +295,10 @@ def generate_subject(sid, cohort, model, schedule, device, options):
         both = (ibi_with > 0) & (ibi_without > 0)
         diff_event = (ibi_with - ibi_without)[both & flags]
         diff_other = (ibi_with - ibi_without)[both & ~flags]
-        counterfactual = dict(epochs=chosen, ppg_with_events=with_events, ppg_events_zeroed=without,
-                              ibi_with_events=ibi_with.astype(np.float32), ibi_events_zeroed=ibi_without.astype(np.float32))
+        arrays.update(counterfactual_epochs=chosen, counterfactual_ppg_with_events=with_events,
+                      counterfactual_ppg_events_zeroed=without,
+                      counterfactual_ibi_with_events=ibi_with.astype(np.float32),
+                      counterfactual_ibi_events_zeroed=ibi_without.astype(np.float32))
         metrics["events"].update(
             counterfactual_windows=int(chosen.size),
             counterfactual_ibi_change_event_samples_ms=float(diff_event.mean() * 1000) if diff_event.size else None,
@@ -189,15 +306,6 @@ def generate_subject(sid, cohort, model, schedule, device, options):
             counterfactual_mean_abs_ppg_change=float(np.abs(with_events - without).mean()),
             within_window_contrast_with_events_ms=event_contrast(ibi_with, events25[chosen])[0],
             within_window_contrast_events_zeroed_ms=event_contrast(ibi_without, events25[chosen])[0])
-    arrays = dict(schema=np.array(SCHEMA), subject=np.array(sid), generated_ppg=ppg,
-                  sqi_generated=sqi.astype(np.float32), sqi_first_attempt=first_sqi.astype(np.float32),
-                  attempts=attempts, sqi_real=sqi_real.astype(np.float32),
-                  ibi_generated=ibi_gen.astype(np.float32), ibi_generated_status=status_gen,
-                  ibi_real_windowed=ibi_real.astype(np.float32), ibi_real_status=status_real,
-                  stages=record["stages"].astype(np.int8), epoch_index=record["epoch_index"],
-                  epoch_ok=record["epoch_ok"], apnea_25hz=events25.astype(np.uint8),
-                  **{f"counterfactual_{k}": v for k, v in counterfactual.items()},
-                  metrics=np.array(json.dumps(metrics, default=float)))
     return arrays, metrics
 
 

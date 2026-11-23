@@ -67,11 +67,48 @@ class NightGenerationTests(unittest.TestCase):
         self.assertTrue((attempts == 3).all())                                   # nothing reaches 0.999
         np.testing.assert_allclose(pg.windowed(ppg)[2], sqi, atol=1e-6)          # stored SQI is the kept one's
 
+    def test_quality_measures_and_quality_only_run(self):
+        import ppg_generation as pg
+        from test_ppg_training import pulse_epochs
+
+        clean = pulse_epochs(np.random.default_rng(5), 4, 0.85)
+        noise = np.random.default_rng(6).normal(size=(4, 1500)).astype(np.float32)
+        q_clean, q_noise = pg.quality_measures(clean), pg.quality_measures(noise, workers=2)
+        self.assertGreater(np.nanmin(q_clean["templatematch"]), 0.9)
+        self.assertLess(np.nanmedian(q_noise["templatematch"]), np.nanmedian(q_clean["templatematch"]))
+        self.assertGreater(np.nanmedian(q_clean["relative_power"]), np.nanmedian(q_noise["relative_power"]))
+        self.assertTrue(np.all(q_clean["beats"] >= 30))
+        parallel = pg.quality_measures(np.tile(clean, (6, 1)), workers=3)
+        np.testing.assert_allclose(parallel["templatematch"][:4], q_clean["templatematch"])
+        same = pg.compare_quality(q_clean, q_clean)
+        self.assertEqual(same["templatematch"]["w1"], 0.0)
+        self.assertEqual(same["templatematch_below_0.8"]["gen"], 0.0)
+
+        out = self.folder / "quality_only"
+        result = self.generate(out, "--subjects", "S001")
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse((out / "night_npz").exists())                       # no IBI without --ibi
+        with np.load(out / "subjects" / "S001.npz") as z:
+            self.assertEqual(z["quality_gen_templatematch"].shape, (14,))
+            self.assertEqual(z["quality_real_skewness"].shape, (14,))
+            self.assertNotIn("ibi_generated", z.files)
+            self.assertTrue((z["attempts"] == 1).all())                          # no regeneration by default
+        metrics = json.loads((out / "subjects" / "S001.json").read_text())
+        self.assertGreater(metrics["quality"]["templatematch"]["median_real"], 0.9)
+        self.assertIn("Light", metrics["quality_by_stage"])
+        row = next(csv.DictReader((out / "subjects_summary.csv").read_text().splitlines()))
+        self.assertNotEqual(row["templatematch_median_gen"], "")
+        self.assertEqual(row["w1_ms"], "")
+        from scripts import plot_ppg_quality
+        with contextlib.redirect_stdout(io.StringIO()):
+            target = plot_ppg_quality.main([str(out)])
+        self.assertTrue(Path(target).is_file())
+
     def test_nights_metrics_resume_and_frozen_checkpoint(self):
         out = self.folder / "nights"
-        check = self.generate(out, "--check-only")
+        check = self.generate(out, "--check-only", "--ibi")
         self.assertEqual(check["subjects"], 6)
-        first = self.generate(out, "--subjects", "S001", "S002")
+        first = self.generate(out, "--subjects", "S001", "S002", "--ibi", "--quality-threshold", "0.8")
         self.assertEqual(first["status"], "completed")
         self.assertEqual(first["summary"]["written"], 2)
         with np.load(out / "subjects" / "S001.npz") as z:
@@ -98,7 +135,7 @@ class NightGenerationTests(unittest.TestCase):
         original = (self.run_dir / "best.pt").read_bytes()
         (self.run_dir / "best.pt").write_bytes(b"replaced by a later epoch")
         try:
-            again = self.generate(out)                                          # continues with the others
+            again = self.generate(out, "--ibi", "--quality-threshold", "0.8")    # continues with the others
         finally:
             (self.run_dir / "best.pt").write_bytes(original)
         self.assertEqual(again["summary"]["written"], 6)
@@ -107,9 +144,9 @@ class NightGenerationTests(unittest.TestCase):
         with np.load(out / "subjects" / "S001.npz") as z:
             np.testing.assert_array_equal(z["generated_ppg"], generated)
         with self.assertRaises(SystemExit):                                     # other options, same folder
-            self.generate(out, "--seed", "7")
+            self.generate(out, "--seed", "7", "--ibi", "--quality-threshold", "0.8")
         twin = self.folder / "nights_twin"
-        self.generate(twin, "--subjects", "S001")
+        self.generate(twin, "--subjects", "S001", "--ibi", "--quality-threshold", "0.8")
         with np.load(twin / "subjects" / "S001.npz") as z:
             np.testing.assert_array_equal(z["generated_ppg"], generated)       # same seed, same night
 
