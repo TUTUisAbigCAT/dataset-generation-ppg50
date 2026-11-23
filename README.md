@@ -8,17 +8,31 @@
 
 ## 50 Hz PPG 生成：DREAMT 2.2.0 PPG 提取（dataset-generation-ppg50）
 
-本仓库从 dataset-generation-30s-apnea（`4d31531`）分出，用来做“直接生成 PPG → 转 IBI → 睡眠分期”；30 秒 IBI + 呼吸事件的实验仍在原仓库，本仓库不改动它。下面第一步是提取训练用的真实 PPG。
+本仓库从 dataset-generation-30s-apnea（`4d31531`）分出，用来做“直接生成 PPG → 转 IBI → 睡眠分期”；30 秒 IBI + 呼吸事件的实验仍在原仓库，本仓库不改动它。**生成 PPG 用 50 Hz（每 30 秒 1500 点）；转 IBI 时升到 100 Hz 走老师的流程；IBI 为 25 Hz（每 30 秒 750 点）。** 文件：`ppg_extraction.py`、`scripts/extract_ppg.py`、`submit_extract_ppg.sh`。**原始 CSV 只读**，结果写到新文件夹（默认 `/home/yxtao/links/scratch/WatchSleepProcessedDataset/DREAMT22_PPG50`）。
 
-目标：让生成模型直接生成 50 Hz PPG（每 30 秒 1500 点），再把 PPG 转成和 WatchSleepNet 相同格式的 IBI（25 Hz、逐点保持上一个心跳间期、0.3–2.0 s 以外记 0）去做睡眠分期。这一步先从 DREAMT 2.2.0 原始 CSV 提取训练用的真实 PPG，并用 PSG 的 ECG 检查它有多准。文件：`ppg_extraction.py`、`scripts/extract_ppg.py`、`submit_extract_ppg.sh`。**原始 CSV 只读**，结果写到新文件夹（默认 `/home/yxtao/links/scratch/WatchSleepProcessedDataset/DREAMT22_PPG50`）。
+**PPG → IBI（`ppg_extraction.ppg_to_ibi`，真实和生成的 PPG 走同一个函数）：**
 
-1. **按 PSG 的 30 秒网格切 epoch**：从睡眠阶段变化点推出网格偏移（`report.csv` 的 `stage_changes_on_grid_fraction` 应为 1），只保留整段阶段一致且标为 W/N1/N2/N3/R 的 epoch，阶段编码 0–4（N1、N2 分开存，训练时再合并为 Light）。和 WatchSleepNet 的滑动查找不同，epoch 边界就是 PSG 判读的边界。
-2. **PPG**：E4 BVP 整晚零相位 0.5–8 Hz 带通，抗混叠 2:1 降到 50 Hz；不做归一化（训练时按窗口做）。
-3. **心跳与 IBI**：neurokit2 Elgendi 检测峰，再在 500 Hz 三次样条上细化峰位（补回 50 Hz 的时间分辨率）。真实 PPG 和以后生成的 PPG 都走同一个函数 `ppg_extraction.ppg_to_ibi`；连续的 epoch 先拼起来再检测，所以 epoch 边界不会出现人为的 0。
-4. **用 ECG 做参照**：PSG ECG 的 R 峰（同样细化）给出 PPG 相对 ECG 的延迟（脉搏到达时间，正常约 0.2–0.5 s）和整夜每 30 分钟的漂移，用来判断 E4 与 PSG 是否对齐（`aligned`）；逐拍匹配给出灵敏度、PPV 和 IBI 误差（ms），同时比较 50 Hz、100 Hz、不细化，以及 WatchSleepNet 原来逐 epoch 的方法。
-5. **质量只标记不修改**：每个 epoch 存模板相关 SQI、手腕运动（ACC 幅值标准差，g）、平台段比例、缺失比例、ECG 心跳被 PPG 检出的比例；Kubios 方法标出异常心跳。`good_epoch` 只是按阈值算出的标记，阈值可在命令行改。
+1. 连续的 30 秒 epoch 拼成一整段再处理，不按 30 秒切开处理。
+2. 每段升到 100 Hz（50 Hz PPG 带宽有限，升采样不增加内容），`nk.ppg_clean(method="elgendi")` + `nk.ppg_peaks`，再用三点抛物线插值细化峰位（不需要 500 Hz 上采样）。
+3. IBI = 相邻峰的时间差。超出 0.3–2.0 s 的间期为坏间期；连续坏间期不超过 2 个且不超过 3 s、两侧都有好间期时，在 25 Hz 网格上用两侧好间期线性插值补上；更长的坏段、段首段尾的坏段、心跳之外的点记 0。好间期和 WatchSleepNet 一样“保持”（每个 25 Hz 点取它所在心跳间期的值）。每个点的状态存在 `ibi_ppg_status`（0 实测、1 插值、2 坏段置 0、3 无心跳）。
+4. 切成 750 点的 30 秒 epoch；有效点（实测或插值）不到一半的 epoch，`epoch_ok = False`（分类时置 0，训练生成模型时可在 loss 里 mask）。
 
-每人一个 `<SID>.npz`：`ppg [n,1500]`、`stages`、`epoch_index`、`epoch_start_s`、`events [n,1500,4]`、`ibi_ppg / ibi_ecg / ibi_wsn [n,750]`、各路心跳时刻、各项质量和 `good_epoch`；另有 `report.json`、`report.csv`。
+阈值都是参数（`--ibi-min`、`--ibi-max`、`--max-fill-intervals`、`--max-fill-seconds`、`--min-valid-fraction`），老师确认后可直接改。
+
+**每个人还存了几种对照，全部和 PSG ECG 的 IBI 比较误差：**
+
+| 字段 | 做法 |
+|---|---|
+| `ibi_ppg`（主结果） | 存下的 50 Hz PPG → 100 Hz → 上面 1–4 步（生成 PPG 也走这条路） |
+| `ibi_ppg_relative` | 同上，另把偏离局部中位数（11 个间期）超过 30% 的间期也算坏间期（能抓到 0.3–2.0 s 范围内的漏检和多检） |
+| `ibi_ppg_raw` | 同上，但不插值（所有坏间期置 0，即 WatchSleepNet 的规则） |
+| `ibi_ppg100` | 原始 100 Hz BVP 直接走 1–4 步（老师的原始做法，用来确认 50 Hz 没有损失） |
+| `ibi_wsn` | WatchSleepNet 原来逐 30 秒处理的方法 |
+| `ibi_ecg` | PSG ECG 的 R 峰（参照） |
+
+其他：按 PSG 的 30 秒判读边界切 epoch（只留阶段一致且为 W/N1/N2/N3/R 的 epoch，编码 0–4）；`ppg [n,1500]` 为整晚 0.5–8 Hz 零相位带通后降到 50 Hz 的 PPG，不做归一化；`events [n,1500,4]`；PPG 相对 ECG 的延迟和整夜漂移（判断 E4 与 PSG 是否对齐）；每个 epoch 的 SQI、手腕运动、平台段、缺失比例。
+
+在 Trillium 上（CPU 作业，排队比 GPU 快；**必须从 CPU 登录节点 `trillium.scinet.utoronto.ca` 提交**，每个作业是一整个 192 核节点，全部人并行处理）：
 
 ```bash
 # 仓库放在 /project/def-plago/yxtao/dataset-generation-ppg50，环境沿用 v2：ln -s ../dataset-generation-v2/.venv .venv
@@ -27,7 +41,7 @@ SUBJECTS="S002 S092" sbatch submit_extract_ppg.sh    # 先测两个人
 sbatch submit_extract_ppg.sh                         # 全部（重交会跳过已完成的人）
 ```
 
-先看 `report.csv` 的 `aligned`、`pulse_arrival_s`、`ppg50_ibi_mae_ms`（对比 `watchsleepnet_ibi_mae_ms`）和 `good_epoch_fraction`。注意：做分类实验时，生成模型只能用分类训练集里的人训练，否则测试集的人会泄漏进生成数据。
+先看 `report.csv`：`aligned`、`pulse_arrival_s`（正常约 0.2–0.5 s）；各 IBI 的 `*_mae_ms`、`*_coverage`、`*_big_error_fraction`（与 ECG 相差 > 100 ms 的比例）；`epoch_ok_fraction`。注意：做分类实验时，生成模型只能用分类训练集里的人训练，否则测试集的人会泄漏进生成数据。
 
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）
 

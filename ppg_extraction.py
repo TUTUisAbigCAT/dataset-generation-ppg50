@@ -1,30 +1,33 @@
-"""DREAMT 2.2.0 PPG extraction at 50 Hz with PSG-ECG checks (read-only on the raw CSVs).
+"""DREAMT 2.2.0 PPG at 50 Hz and the PPG -> 25 Hz IBI path shared by real and generated PPG.
 
-For every participant this builds, on the PSG 30-second grid:
-  * the wrist PPG (E4 BVP) band-passed 0.5-8 Hz on the whole night (zero phase)
-    and resampled with anti-aliasing to 50 Hz (1500 samples per epoch);
-  * sleep stage per epoch (W=0, N1=1, N2=2, N3=3, R=4), respiratory-event
-    flags at 50 Hz (Obstructive_Apnea, Central_Apnea, Hypopnea, Multiple_Events);
-  * beat times from the 50 Hz PPG (the same path generated PPG will take), from
-    the 100 Hz PPG, and ECG R peaks from the PSG ECG, each refined on a 500 Hz
-    cubic-spline grid around every detected peak;
-  * the PPG-to-ECG lag (pulse arrival time), its stability over the night and
-    a coarse heart-rate cross-correlation lag, which flag a misaligned night;
-  * beat matching PPG vs ECG (sensitivity, PPV) and the IBI error in ms for the
-    50 Hz, 100 Hz and WatchSleepNet per-epoch pipelines;
-  * per-epoch quality: PPG template-match SQI, wrist motion (ACC), flat-line
-    fraction, missing samples, share of ECG beats matched by PPG beats;
-  * IBI at 25 Hz in the WatchSleepNet sample-and-hold format (values outside
-    0.3-2.0 s written as 0) from the stored 50 Hz PPG epochs with ppg_to_ibi
-    (consecutive epochs joined, so no artificial zeros at epoch edges; generated
-    PPG goes through the same function), from ECG (reference) and with the
-    WatchSleepNet per-epoch method (for comparison with the published pipeline).
+PPG -> IBI (ppg_to_ibi; identical for real and generated PPG):
+  1. Contiguous blocks: consecutive 30-s epochs are joined; nothing is processed per 30-s chunk.
+  2. Each block is resampled to 100 Hz (50 Hz PPG is band-limited, so this adds no content),
+     cleaned with nk.ppg_clean(method="elgendi"), peaks from nk.ppg_peaks, and every peak is
+     refined by 3-point parabolic interpolation (sub-sample timing, no 500 Hz upsampling).
+  3. IBI = diff(peak times). Intervals outside 0.3-2.0 s (optionally also those far from the local
+     median) are bad. A short run of bad intervals (<= 2 intervals and <= 3 s, with good intervals
+     on both sides) is filled on the 25 Hz grid by linear interpolation between the neighbouring
+     good intervals; longer runs, runs at a block edge and samples outside the beats are 0.
+     Good intervals are written as in WatchSleepNet: each 25 Hz sample holds the interval of the
+     beat pair around it.
+  4. The 25 Hz series is cut into 30-s epochs of 750 samples; an epoch with less than half of its
+     samples valid (measured or filled) gets epoch_ok = False (zero it or mask it in the loss).
 
-Nothing is discarded: every metric is stored per epoch, and the thresholds that
-decide which epochs count as good are applied in the summary only.
+Extraction of one participant (extract_subject) builds on the PSG 30-s grid:
+  * PPG: E4 BVP band-passed 0.5-8 Hz on the whole night (zero phase), anti-aliased to 50 Hz,
+    stored per epoch [n, 1500] and not normalized;
+  * stages (W=0, N1=1, N2=2, N3=3, R=4) and respiratory events at 50 Hz;
+  * IBI from the stored 50 Hz PPG with the path above (the one generated PPG will take), the same
+    with the extra relative rule, without any filling, from the raw 100 Hz BVP (the teacher's
+    original route), with WatchSleepNet's per-epoch method, and from the PSG ECG (reference);
+  * PPG-to-ECG lag and its drift, beat sensitivity/PPV and errors of every IBI variant against
+    the ECG IBI, and per-epoch quality (template SQI, wrist motion, flat and missing fractions).
+Raw CSVs are only read; flags never remove anything from the stored arrays.
 """
 from __future__ import annotations
 
+from fractions import Fraction
 import hashlib
 import json
 from pathlib import Path
@@ -32,9 +35,10 @@ import warnings
 
 import numpy as np
 
-SCHEMA = "dreamt_ppg50_extraction_v1"
+SCHEMA = "dreamt_ppg50_extraction_v2"
 FS_RAW = 100
 FS_PPG = 50
+FS_DETECT = 100
 FS_IBI = 25
 EPOCH_SECONDS = 30
 EPOCH_ROWS = FS_RAW * EPOCH_SECONDS          # 3000
@@ -43,7 +47,11 @@ EPOCH_IBI = FS_IBI * EPOCH_SECONDS           # 750
 STAGE_CODES = {"W": 0, "N1": 1, "N2": 2, "N3": 3, "R": 4}
 EVENT_COLUMNS = ("Obstructive_Apnea", "Central_Apnea", "Hypopnea", "Multiple_Events")
 IBI_RANGE = (0.3, 2.0)
-DEFAULT_THRESHOLDS = dict(sqi=0.86, ecg_match=0.9, acc_std_g=0.05, flat_fraction=0.05, nan_fraction=0.0)
+# 25 Hz sample status
+MEASURED, INTERPOLATED, ARTIFACT, NO_BEAT = 0, 1, 2, 3
+DEFAULT_CLEANING = dict(ibi_min=0.3, ibi_max=2.0, max_fill_intervals=2, max_fill_s=3.0,
+                        relative_threshold=None, relative_window=11, min_valid_fraction=0.5)
+DEFAULT_RELATIVE_THRESHOLD = 0.3
 
 
 def sha256_file(path, chunk=1 << 22):
@@ -52,6 +60,16 @@ def sha256_file(path, chunk=1 << 22):
         for block in iter(lambda: stream.read(chunk), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def cleaning_options(**overrides):
+    unknown = set(overrides) - set(DEFAULT_CLEANING)
+    if unknown:
+        raise ValueError(f"Unknown cleaning options {sorted(unknown)}")
+    options = dict(DEFAULT_CLEANING, **overrides)
+    if not 0 < options["ibi_min"] < options["ibi_max"]:
+        raise ValueError("Need 0 < ibi_min < ibi_max")
+    return options
 
 
 # --------------------------------------------------------------------------- epochs
@@ -66,19 +84,33 @@ def epoch_grid(stage_labels, *, epoch_rows=EPOCH_ROWS):
     codes = np.fromiter((STAGE_CODES.get(value, -1) for value in labels), dtype=np.int64, count=len(labels))
     changes = np.flatnonzero(labels[1:] != labels[:-1]) + 1
     if changes.size:
-        residues = changes % epoch_rows
-        values, counts = np.unique(residues, return_counts=True)
-        offset = int(values[np.argmax(counts)])
-        on_grid = float(counts.max() / changes.size)
+        values, counts = np.unique(changes % epoch_rows, return_counts=True)
+        offset, on_grid = int(values[np.argmax(counts)]), float(counts.max() / changes.size)
     else:
         offset, on_grid = 0, 1.0
-    epochs = (len(labels) - offset) // epoch_rows
-    starts = offset + epoch_rows * np.arange(max(epochs, 0), dtype=np.int64)
-    block = codes[offset:offset + epochs * epoch_rows].reshape(epochs, epoch_rows) if epochs else np.zeros((0, epoch_rows))
-    first = block[:, 0] if epochs else np.zeros(0, dtype=np.int64)
-    valid = (first >= 0) & np.all(block == first[:, None], axis=1) if epochs else np.zeros(0, dtype=bool)
+    epochs = max((len(labels) - offset) // epoch_rows, 0)
+    starts = offset + epoch_rows * np.arange(epochs, dtype=np.int64)
+    if epochs:
+        block = codes[offset:offset + epochs * epoch_rows].reshape(epochs, epoch_rows)
+        first = block[:, 0]
+        valid = (first >= 0) & np.all(block == first[:, None], axis=1)
+    else:
+        first, valid = np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool)
     return dict(offset=offset, starts=starts, codes=first.astype(np.int64), valid=valid,
                 on_grid_fraction=on_grid, changes=int(changes.size))
+
+
+def epoch_runs(epoch_start_s, epoch_seconds=EPOCH_SECONDS):
+    """Index arrays of epochs that follow each other without a gap (the contiguous blocks)."""
+    starts = np.asarray(epoch_start_s, dtype=np.float64)
+    if not starts.size:
+        return []
+    breaks = np.flatnonzero(np.abs(np.diff(starts) - epoch_seconds) > 1e-6) + 1
+    return np.split(np.arange(starts.size), breaks)
+
+
+def epoch_sample_times(epoch_start_s, fs, samples):
+    return np.asarray(epoch_start_s, dtype=np.float64)[:, None] + np.arange(samples, dtype=np.float64)[None, :] / fs
 
 
 # --------------------------------------------------------------------------- beats
@@ -93,43 +125,53 @@ def _fill_nan(signal):
     return signal, bad
 
 
-def refine_peaks(signal, peaks, fs, *, target_fs=500, half_window_s=0.04):
-    """Peak times in seconds, refined on a target_fs cubic-spline grid around each detected peak."""
-    from scipy.interpolate import CubicSpline
+def refine_peaks_parabolic(signal, peaks, sampling_rate):
+    """Sub-sample peak positions by 3-point parabolic interpolation across y[p-1], y[p], y[p+1].
 
-    signal = np.asarray(signal, dtype=np.float64)
-    peaks = np.asarray(peaks, dtype=np.int64)
-    half = max(2, int(round(half_window_s * fs)))
-    times = peaks.astype(np.float64) / fs
-    step = 1.0 / target_fs
-    for k, p in enumerate(peaks):
-        lo, hi = max(0, p - half), min(signal.size, p + half + 1)
-        if hi - lo < 4:
-            continue
-        x = np.arange(lo, hi, dtype=np.float64) / fs
-        spline = CubicSpline(x, signal[lo:hi])
-        grid = np.arange(x[0], x[-1] + step / 2, step)
-        times[k] = grid[int(np.argmax(spline(grid)))]
-    return times
-
-
-def ppg_beats(ppg, fs, *, refine=True):
-    """(peak_times_s, peak_samples, cleaned) with neurokit2's Elgendi cleaning and detector.
-
-    The same function serves real and generated PPG, at any sampling rate.
+    Returns (exact_peak_samples, exact_peak_times_s); the shift is clipped to +-0.5 sample and
+    flat tops are left unchanged.
     """
+    y = np.asarray(signal, dtype=np.float64)
+    peaks = np.asarray(peaks, dtype=np.int64)
+    exact = peaks.astype(np.float64)
+    valid = (peaks > 0) & (peaks < y.size - 1)
+    p = peaks[valid]
+    y_prev, y_curr, y_next = y[p - 1], y[p], y[p + 1]
+    denominator = y_prev - 2.0 * y_curr + y_next
+    safe = denominator < -1e-12
+    delta = np.zeros(p.size, dtype=np.float64)
+    delta[safe] = 0.5 * (y_prev[safe] - y_next[safe]) / denominator[safe]
+    exact[valid] += np.clip(delta, -0.5, 0.5)
+    return exact, exact / float(sampling_rate)
+
+
+def ppg_peaks(signal, fs):
+    """(cleaned, integer peaks): nk.ppg_clean(method="elgendi") and nk.ppg_peaks at fs."""
     import neurokit2 as nk
 
-    signal, _ = _fill_nan(ppg)
+    signal, _ = _fill_nan(signal)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         cleaned = np.asarray(nk.ppg_clean(signal, sampling_rate=fs, method="elgendi"), dtype=np.float64)
         try:
-            peaks = np.asarray(nk.ppg_findpeaks(cleaned, sampling_rate=fs, method="elgendi")["PPG_Peaks"], dtype=np.int64)
-        except Exception:                                  # flat or too short signal
+            if hasattr(nk, "ppg_peaks"):
+                peaks = nk.ppg_peaks(cleaned, sampling_rate=fs, method="elgendi")[1]["PPG_Peaks"]
+            else:                                        # neurokit2 < 0.2.4
+                peaks = nk.ppg_findpeaks(cleaned, sampling_rate=fs, method="elgendi")["PPG_Peaks"]
+            peaks = np.asarray(peaks, dtype=np.int64)
+        except Exception:                                # flat or too short signal
             peaks = np.zeros(0, dtype=np.int64)
-    times = refine_peaks(cleaned, peaks, fs) if refine else peaks / float(fs)
-    return times, peaks, cleaned
+    return cleaned, peaks
+
+
+def resample_to(signal, fs, target_fs):
+    """Band-limited polyphase resampling; sample i of the result sits at time i / target_fs."""
+    from scipy.signal import resample_poly
+
+    if fs == target_fs:
+        return np.asarray(signal, dtype=np.float64)
+    ratio = Fraction(target_fs).limit_denominator(1000) / Fraction(fs).limit_denominator(1000)
+    return resample_poly(np.asarray(signal, dtype=np.float64), ratio.numerator, ratio.denominator)
 
 
 def ecg_is_inverted(cleaned, fs, *, window_s=2.0):
@@ -145,8 +187,8 @@ def ecg_is_inverted(cleaned, fs, *, window_s=2.0):
     return bool(np.nanmedian(extreme) < 0)
 
 
-def ecg_beats(ecg, fs, *, refine=True):
-    """R-peak times in seconds (neurokit2), refined on the polarity-corrected cleaned ECG."""
+def ecg_beats(ecg, fs):
+    """R-peak times in seconds (neurokit2, polarity checked, parabolic refinement)."""
     import neurokit2 as nk
 
     signal, _ = _fill_nan(ecg)
@@ -157,103 +199,136 @@ def ecg_beats(ecg, fs, *, refine=True):
         if inverted:
             cleaned = -cleaned
         peaks = np.asarray(nk.ecg_peaks(cleaned, sampling_rate=fs)[1]["ECG_R_Peaks"], dtype=np.int64)
-    times = refine_peaks(cleaned, peaks, fs) if refine else peaks / float(fs)
-    return times, peaks, bool(inverted)
+    return refine_peaks_parabolic(cleaned, peaks, fs)[1], inverted
 
 
-def artifact_beats(peak_samples, fs):
-    """Bool per beat: ectopic, missed, extra or long/short beats (Kubios method); beats are flagged, never moved."""
-    import neurokit2 as nk
+# --------------------------------------------------------------------------- PPG -> IBI
+def ppg_blocks(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, epoch_seconds=EPOCH_SECONDS):
+    """Step 2 on every contiguous block: list of dicts (epochs, beat times, unrefined times, cleaned SQI)."""
+    epochs = np.asarray(epochs, dtype=np.float64)
+    samples = int(round(fs * epoch_seconds))
+    if epochs.ndim != 2 or epochs.shape[1] != samples:
+        raise ValueError(f"epochs must be [n, {samples}] at {fs} Hz; got {epochs.shape}")
+    starts = np.asarray(epoch_start_s, dtype=np.float64)
+    if starts.shape != (epochs.shape[0],):
+        raise ValueError("epoch_start_s needs one start time per epoch")
+    per_epoch = int(round(detect_fs * epoch_seconds))
+    blocks = []
+    for run in epoch_runs(starts, epoch_seconds):
+        signal = resample_to(epochs[run].reshape(-1), fs, detect_fs)
+        cleaned, peaks = ppg_peaks(signal, detect_fs)
+        _, times = refine_peaks_parabolic(cleaned, peaks, detect_fs)
+        bounds = [(k * per_epoch, (k + 1) * per_epoch) for k in range(run.size)]
+        blocks.append(dict(epochs=run, beat_times_s=times + starts[run[0]],
+                           unrefined_s=peaks / float(detect_fs) + starts[run[0]],
+                           sqi=template_sqi(cleaned, peaks, detect_fs, bounds),
+                           beats_per_epoch=np.bincount(peaks // per_epoch, minlength=run.size)[:run.size]))
+    return blocks
 
-    flags = np.zeros(len(peak_samples), dtype=bool)
-    if len(peak_samples) < 10:
-        return flags
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            info, _ = nk.signal_fixpeaks(np.asarray(peak_samples), sampling_rate=fs, iterative=False, method="Kubios")
-        except Exception:
-            return flags
-    for key in ("ectopic", "missed", "extra", "longshort"):
-        index = np.asarray(info.get(key, []), dtype=np.int64)
-        index = index[(index >= 0) & (index < flags.size)]
-        flags[index] = True
-    return flags
 
+def classify_intervals(beat_times, options):
+    """Step 3 on one block: (ibi, status, fill) per interval; status 0 good, 1 filled, 2 zeroed.
 
-# --------------------------------------------------------------------------- IBI at 25 Hz
-def ibi_at(times_s, beat_times, *, flagged=None, ibi_range=IBI_RANGE):
-    """WatchSleepNet sample-and-hold IBI at arbitrary times: (values, flag).
-
-    Each time takes the interval of the beat pair around it; before the first
-    and after the last beat, or outside ibi_range, the value is 0.
+    fill holds (t_start, ibi_before, t_end, ibi_after) for filled intervals (NaN elsewhere).
     """
+    t = np.asarray(beat_times, dtype=np.float64)
+    ibi = np.diff(t)
+    n = ibi.size
+    status = np.zeros(n, dtype=np.uint8)
+    fill = tuple(np.full(n, np.nan) for _ in range(4))
+    if not n:
+        return ibi, status, fill
+    bad = (ibi < options["ibi_min"]) | (ibi >= options["ibi_max"])
+    if options.get("relative_threshold"):
+        import pandas as pd
+
+        local = pd.Series(np.where(bad, np.nan, ibi)).rolling(
+            int(options["relative_window"]), center=True, min_periods=3).median().to_numpy()
+        bad |= np.isfinite(local) & (np.abs(ibi - local) > options["relative_threshold"] * local)
+    edges = np.flatnonzero(np.diff(np.r_[0, bad.astype(np.int8), 0]))
+    for a, b in zip(edges[::2], edges[1::2]):           # bad intervals a .. b-1, from beat a to beat b
+        fillable = (b - a <= options["max_fill_intervals"] and t[b] - t[a] <= options["max_fill_s"]
+                    and a > 0 and b < n)
+        if fillable:
+            status[a:b] = 1
+            for array, value in zip(fill, (t[a], ibi[a - 1], t[b], ibi[b])):
+                array[a:b] = value
+        else:
+            status[a:b] = 2
+    return ibi, status, fill
+
+
+def intervals_to_samples(sample_times, beat_times, ibi, status, fill):
+    """25 Hz values and sample status from classified intervals (WatchSleepNet hold for good ones)."""
+    sample_times = np.asarray(sample_times, dtype=np.float64)
+    values = np.zeros(sample_times.shape, dtype=np.float64)
+    code = np.full(sample_times.shape, NO_BEAT, dtype=np.uint8)
+    if ibi.size == 0:
+        return values, code
+    k = np.searchsorted(beat_times, sample_times, side="right") - 1
+    inside = (k >= 0) & (k < ibi.size)
+    kk, tau = k[inside], sample_times[inside]
+    state = status[kk]
+    t_a, v_a, t_b, v_b = (array[kk] for array in fill)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        filled = v_a + (v_b - v_a) * (tau - t_a) / (t_b - t_a)
+    values[inside] = np.where(state == 0, ibi[kk], np.where(state == 1, filled, 0.0))
+    code[inside] = np.array([MEASURED, INTERPOLATED, ARTIFACT], dtype=np.uint8)[state]
+    return values, code
+
+
+def blocks_to_ibi(blocks, epoch_start_s, options, *, out_fs=FS_IBI, epoch_seconds=EPOCH_SECONDS):
+    """Steps 3-4: IBI [n, out_fs*30], sample status, valid fraction and epoch_ok for all epochs."""
+    starts = np.asarray(epoch_start_s, dtype=np.float64)
+    samples = int(round(out_fs * epoch_seconds))
+    ibi = np.zeros((starts.size, samples), dtype=np.float32)
+    status = np.full((starts.size, samples), NO_BEAT, dtype=np.uint8)
+    for block in blocks:
+        run = block["epochs"]
+        times = epoch_sample_times(starts[run], out_fs, samples)
+        beats = block["beat_times_s"]
+        values, code = intervals_to_samples(times, beats, *classify_intervals(beats, options))
+        ibi[run], status[run] = values, code
+    valid_fraction = np.isin(status, (MEASURED, INTERPOLATED)).mean(axis=1).astype(np.float32)
+    return dict(ibi=ibi, status=status, valid_fraction=valid_fraction,
+                epoch_ok=valid_fraction >= options["min_valid_fraction"])
+
+
+def ppg_to_ibi(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, **cleaning):
+    """PPG epochs [n, fs*30] (real or generated) -> WatchSleepNet-format 25 Hz IBI [n, 750] plus beats.
+
+    Consecutive epochs (by epoch_start_s) form one block; see the module docstring for the steps.
+    """
+    options = cleaning_options(**cleaning)
+    blocks = ppg_blocks(epochs, fs, epoch_start_s, detect_fs=detect_fs)
+    result = blocks_to_ibi(blocks, epoch_start_s, options)
+    n = len(epoch_start_s)
+    join = lambda key: np.concatenate([b[key] for b in blocks]) if blocks else np.zeros(0)
+    sqi, beats_per_epoch = np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.int32)
+    for block in blocks:
+        sqi[block["epochs"]], beats_per_epoch[block["epochs"]] = block["sqi"], block["beats_per_epoch"]
+    result.update(beat_times_s=join("beat_times_s"), beat_times_unrefined_s=join("unrefined_s"),
+                  sqi=sqi, beats_per_epoch=beats_per_epoch, options=options)
+    return result
+
+
+def ibi_at(times_s, beat_times, *, ibi_range=IBI_RANGE):
+    """Plain WatchSleepNet hold at arbitrary times (no filling): out-of-range intervals and edges are 0."""
     times_s = np.asarray(times_s, dtype=np.float64)
     beats = np.asarray(beat_times, dtype=np.float64)
     values = np.zeros(times_s.shape, dtype=np.float64)
-    flag = np.zeros(times_s.shape, dtype=np.uint8)
     if beats.size < 2:
-        return values.astype(np.float32), flag
+        return values.astype(np.float32)
     index = np.searchsorted(beats, times_s, side="right") - 1
     inside = (index >= 0) & (index < beats.size - 1)
     k = index[inside]
     interval = beats[k + 1] - beats[k]
-    interval = np.where((interval >= ibi_range[0]) & (interval < ibi_range[1]), interval, 0.0)
-    values[inside] = interval
-    if flagged is not None:
-        flagged = np.asarray(flagged, dtype=bool)
-        flag[inside] = (flagged[k] | flagged[k + 1]).astype(np.uint8)
-    return values.astype(np.float32), flag
-
-
-def epoch_sample_times(epoch_start_s, fs, samples):
-    return np.asarray(epoch_start_s, dtype=np.float64)[:, None] + np.arange(samples, dtype=np.float64)[None, :] / fs
-
-
-def epoch_runs(epoch_start_s, epoch_seconds=EPOCH_SECONDS):
-    """Index arrays of epochs that follow each other without a gap."""
-    starts = np.asarray(epoch_start_s, dtype=np.float64)
-    if not starts.size:
-        return []
-    breaks = np.flatnonzero(np.abs(np.diff(starts) - epoch_seconds) > 1e-6) + 1
-    return np.split(np.arange(starts.size), breaks)
-
-
-def ppg_to_ibi(epochs, fs, epoch_start_s, *, refine=True, flag_artifacts=True, out_fs=FS_IBI,
-               epoch_seconds=EPOCH_SECONDS):
-    """PPG epochs [n, fs*30] -> WatchSleepNet-format IBI [n, out_fs*30] plus beats and quality.
-
-    Consecutive epochs (by epoch_start_s) are joined into one signal before beat
-    detection, so IBI is continuous inside a run of epochs; across a gap the
-    interval is longer than 2 s and therefore 0, as in WatchSleepNet. Use the
-    same call for real and generated PPG so both take an identical path.
-    """
-    epochs = np.asarray(epochs, dtype=np.float64)
-    if epochs.ndim != 2 or epochs.shape[1] != int(round(fs * epoch_seconds)):
-        raise ValueError(f"epochs must be [n, {int(round(fs * epoch_seconds))}] at {fs} Hz; got {epochs.shape}")
-    starts = np.asarray(epoch_start_s, dtype=np.float64)
-    if starts.shape != (epochs.shape[0],):
-        raise ValueError("epoch_start_s needs one start time per epoch")
-    n, samples = epochs.shape
-    times, unrefined, artifacts = [], [], []
-    sqi = np.zeros(n, dtype=np.float32)
-    beats_per_epoch = np.zeros(n, dtype=np.int32)
-    for run in epoch_runs(starts, epoch_seconds):
-        t, peaks, cleaned = ppg_beats(epochs[run].reshape(-1), fs, refine=refine)
-        times.append(t + starts[run[0]])
-        unrefined.append(peaks / float(fs) + starts[run[0]])
-        artifacts.append(artifact_beats(peaks, fs) if flag_artifacts else np.zeros(peaks.size, dtype=bool))
-        sqi[run] = template_sqi(cleaned, peaks, fs, [(k * samples, (k + 1) * samples) for k in range(run.size)])
-        beats_per_epoch[run] = np.bincount(peaks // samples, minlength=run.size)[:run.size]
-    join = lambda parts, dtype: np.concatenate(parts).astype(dtype) if parts else np.zeros(0, dtype=dtype)
-    times, unrefined, artifacts = join(times, np.float64), join(unrefined, np.float64), join(artifacts, bool)
-    ibi, flag = ibi_at(epoch_sample_times(starts, out_fs, int(round(out_fs * epoch_seconds))), times, flagged=artifacts)
-    return dict(ibi=ibi, ibi_flag=flag, beat_times_s=times, beat_times_unrefined_s=unrefined,
-                artifact_beats=artifacts, sqi=sqi, beats_per_epoch=beats_per_epoch)
+    values[inside] = np.where((interval >= ibi_range[0]) & (interval < ibi_range[1]), interval, 0.0)
+    return values.astype(np.float32)
 
 
 def watchsleepnet_epoch_ibi(bvp_100, epoch_starts_rows):
-    """The published WatchSleepNet per-epoch IBI at 25 Hz, plus its absolute peak times (s)."""
+    """The published WatchSleepNet per-epoch IBI at 25 Hz, plus its absolute peak times (s) and epochs."""
     import neurokit2 as nk
 
     out = np.zeros((len(epoch_starts_rows), EPOCH_IBI), dtype=np.float32)
@@ -305,13 +380,12 @@ def hr_cross_lag(ecg_t, ppg_t, *, max_lag_s=60.0, fs=10.0):
     n = 1 << int(np.ceil(np.log2(2 * grid.size)))
     corr = np.fft.irfft(np.fft.rfft(b, n) * np.conj(np.fft.rfft(a, n)), n) / grid.size
     lags = np.r_[np.arange(0, n // 2), np.arange(-n // 2, 0)] / fs
-    window = np.abs(lags) <= max_lag_s
-    best = np.argmax(np.where(window, corr, -np.inf))
+    best = np.argmax(np.where(np.abs(lags) <= max_lag_s, corr, -np.inf))
     return float(lags[best]), float(corr[best])
 
 
 def pulse_arrival(ecg_t, ppg_t, *, max_s=1.0):
-    """Delay from each PPG beat back to the preceding R peak (0 < d < max_s)."""
+    """Delay from each PPG beat back to the preceding R peak (0 < d < max_s) and the PPG beat time."""
     if ecg_t.size == 0 or ppg_t.size == 0:
         return np.zeros(0), np.zeros(0)
     index = np.searchsorted(ecg_t, ppg_t, side="right") - 1
@@ -326,10 +400,8 @@ def mode_lag(lags, *, width=0.05, bin_s=0.01):
     lags = np.asarray(lags, dtype=np.float64)
     if lags.size < 50:
         return None, 0.0
-    edges = np.arange(lags.min(), lags.max() + 2 * bin_s, bin_s)
-    counts, edges = np.histogram(lags, edges)
-    smooth = np.convolve(counts, np.ones(5), mode="same")
-    peak = edges[int(np.argmax(smooth))] + bin_s / 2
+    counts, edges = np.histogram(lags, np.arange(lags.min(), lags.max() + 2 * bin_s, bin_s))
+    peak = edges[int(np.argmax(np.convolve(counts, np.ones(5), mode="same")))] + bin_s / 2
     estimate = float(np.median(lags[np.abs(lags - peak) <= width]))
     return estimate, float(np.mean(np.abs(lags - estimate) <= width))
 
@@ -337,10 +409,9 @@ def mode_lag(lags, *, width=0.05, bin_s=0.01):
 def lag_track(ecg_t, ppg_t, *, coarse=None, block_s=1800.0, min_beats=300):
     """PPG-minus-ECG beat lag: whole-night estimate, concentration and a 30-min track.
 
-    Each PPG beat is paired with the last R peak before it after shifting ECG by
-    a base lag; two bases are tried (-0.2 s for an aligned recording, and
-    coarse - 0.5 s from the heart-rate cross-correlation) and the one whose lags
-    concentrate best is kept.
+    Each PPG beat is paired with the last R peak before it after shifting ECG by a base lag; two
+    bases are tried (-0.2 s for an aligned recording, coarse - 0.5 s from the heart-rate
+    cross-correlation) and the one whose lags concentrate best is kept.
     """
     best = None
     for base in sorted({-0.2} | ({round(coarse - 0.5, 3)} if coarse is not None else set())):
@@ -381,7 +452,6 @@ def match_beats(ecg_t, ppg_t, lag, *, tolerance=0.15):
     pick = np.where(np.abs(ppg_t[left] - expected) <= np.abs(ppg_t[right] - expected), left, right)
     close = np.abs(ppg_t[pick] - expected) <= tolerance
     matched[close] = pick[close]
-    # keep one ECG beat per PPG beat (the closest)
     order = np.argsort(np.abs(ppg_t[np.maximum(matched, 0)] - expected) + (matched < 0) * 1e9)
     seen = set()
     for i in order:
@@ -415,6 +485,28 @@ def error_summary(errors):
                 bias_ms=float(errors.mean() * 1000.0), p95_abs_ms=float(np.quantile(absolute, 0.95)))
 
 
+def beat_accuracy(ecg_t, beats, track, *, pair_ok=None):
+    """(matched, metrics) of PPG beats against ECG R peaks shifted by the lag track."""
+    matched = match_beats(ecg_t, beats, lag_at(ecg_t, track))
+    metrics = dict(sensitivity=float((matched >= 0).mean()) if matched.size else None,
+                   ppv=float(np.unique(matched[matched >= 0]).size / beats.size) if beats.size else None,
+                   **error_summary(ibi_errors(ecg_t, beats, matched, pair_ok=pair_ok)))
+    return matched, metrics
+
+
+def series_accuracy(ibi, reference, *, big_error_s=0.1):
+    """25 Hz IBI against the lag-aligned ECG IBI, on samples where the ECG IBI is valid."""
+    ibi, reference = np.asarray(ibi, dtype=np.float64), np.asarray(reference, dtype=np.float64)
+    ref_ok = reference > 0
+    both = ref_ok & (ibi > 0)
+    if not ref_ok.any():
+        return dict(coverage=None, mae_ms=None, big_error_fraction=None)
+    error = np.abs(ibi[both] - reference[both])
+    return dict(coverage=float(both.sum() / ref_ok.sum()),
+                mae_ms=float(error.mean() * 1000.0) if error.size else None,
+                big_error_fraction=float((error > big_error_s).mean()) if error.size else None)
+
+
 # --------------------------------------------------------------------------- per-epoch quality
 def template_sqi(cleaned, peak_samples, fs, epoch_bounds):
     """Mean correlation of each beat with the epoch's average beat (Orphanidou-style), per epoch."""
@@ -432,12 +524,11 @@ def template_sqi(cleaned, peak_samples, fs, epoch_bounds):
         if inside.size < 3:
             continue
         beats = np.stack([cleaned[p - half:p + half] for p in inside])
-        template = beats.mean(axis=0)
+        centred = beats.mean(axis=0)
+        centred = centred - centred.mean()
         beats = beats - beats.mean(axis=1, keepdims=True)
-        centred = template - template.mean()
         denominator = np.linalg.norm(beats, axis=1) * (np.linalg.norm(centred) or 1.0)
-        r = (beats @ centred) / np.where(denominator > 0, denominator, np.inf)
-        out[e] = float(np.mean(r))
+        out[e] = float(np.mean((beats @ centred) / np.where(denominator > 0, denominator, np.inf)))
     return out
 
 
@@ -456,15 +547,6 @@ def flat_fraction(signal, *, min_run=20):
 
 
 # --------------------------------------------------------------------------- one participant
-def beat_accuracy(ecg_t, beats, track, *, pair_ok=None):
-    """(matched, metrics) of PPG beats against ECG R peaks shifted by the lag track."""
-    matched = match_beats(ecg_t, beats, lag_at(ecg_t, track))
-    metrics = dict(sensitivity=float((matched >= 0).mean()) if matched.size else None,
-                   ppv=float(np.unique(matched[matched >= 0]).size / beats.size) if beats.size else None,
-                   **error_summary(ibi_errors(ecg_t, beats, matched, pair_ok=pair_ok)))
-    return matched, metrics
-
-
 def read_subject_csv(csv_path, ecg_column="ECG"):
     import pandas as pd
 
@@ -480,13 +562,14 @@ def read_subject_csv(csv_path, ecg_column="ECG"):
     return frame
 
 
-def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, thresholds=None, ahi=None):
+def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=None,
+                    relative_threshold=DEFAULT_RELATIVE_THRESHOLD, ahi=None):
     """Return (arrays, report) for one raw DREAMT CSV; see the module docstring."""
     from scipy.signal import butter, resample_poly, sosfiltfilt
 
     from apnea_labels import event_flags
 
-    thresholds = dict(DEFAULT_THRESHOLDS, **(thresholds or {}))
+    options = cleaning_options(**(cleaning or {}))
     csv_path = Path(csv_path)
     frame = read_subject_csv(csv_path, ecg_column)
 
@@ -504,7 +587,7 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, threshold
     if sleep.size:
         in_sleep[sleep[0]:sleep[-1] + 1] = True
 
-    # PPG: whole-night zero-phase 0.5-8 Hz band-pass at 100 Hz, anti-aliased 2:1 to 50 Hz on the epoch phase
+    # stored PPG: whole-night zero-phase 0.5-8 Hz band-pass at 100 Hz, anti-aliased 2:1 on the epoch phase
     bvp_raw = frame["BVP"].to_numpy(dtype=np.float64)
     bvp, bvp_nan = _fill_nan(bvp_raw)
     filtered = sosfiltfilt(butter(3, [0.5, 8.0], btype="bandpass", fs=FS_RAW, output="sos"), bvp)
@@ -515,20 +598,38 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, threshold
         raise ValueError(f"{csv_path.name}: 50 Hz signal shorter than the last epoch")
     ppg = ppg50[take50].astype(np.float32)
 
-    # beats: 50 Hz (the generated-PPG path), 100 Hz, WatchSleepNet per-epoch, ECG
-    p50 = ppg_to_ibi(ppg, FS_PPG, start_s)
-    p100 = ppg_to_ibi(filtered[rows100], FS_RAW, start_s, flag_artifacts=False)
-    ppg_t = p50["beat_times_s"]
-    ibi_wsn, wsn_t, wsn_epoch = (watchsleepnet_epoch_ibi(bvp_raw, starts) if watchsleepnet
-                                 else (np.zeros((keep.size, EPOCH_IBI), np.float32), np.zeros(0), np.zeros(0, np.int64)))
+    # PPG -> IBI: the generated-PPG route (stored 50 Hz -> 100 Hz) and the original 100 Hz route
+    blocks50 = ppg_blocks(ppg, FS_PPG, start_s)
+    blocks100 = ppg_blocks(bvp[rows100], FS_RAW, start_s)
+    variants = dict(
+        ppg50_clean=blocks_to_ibi(blocks50, start_s, options),
+        ppg50_relative=blocks_to_ibi(blocks50, start_s, dict(options, relative_threshold=relative_threshold)),
+        ppg50_raw=blocks_to_ibi(blocks50, start_s, dict(options, max_fill_intervals=0)),
+        ppg100_clean=blocks_to_ibi(blocks100, start_s, options),
+    )
+    main = variants["ppg50_clean"]
+    join = lambda blocks, key: np.concatenate([b[key] for b in blocks]) if blocks else np.zeros(0)
+    ppg_t, ppg100_t = join(blocks50, "beat_times_s"), join(blocks100, "beat_times_s")
+    sqi = np.zeros(keep.size, dtype=np.float32)
+    beats_per_epoch = np.zeros(keep.size, dtype=np.int32)
+    for block in blocks50:
+        sqi[block["epochs"]], beats_per_epoch[block["epochs"]] = block["sqi"], block["beats_per_epoch"]
+
+    if watchsleepnet:
+        ibi_wsn, wsn_t, wsn_epoch = watchsleepnet_epoch_ibi(bvp_raw, starts)
+    else:
+        ibi_wsn, wsn_t, wsn_epoch = np.zeros((keep.size, EPOCH_IBI), np.float32), np.zeros(0), np.zeros(0, np.int64)
+
     ecg_values = frame[ecg_column].to_numpy(dtype=np.float64) if ecg_column in frame.columns else None
     have_ecg = ecg_values is not None and np.isfinite(ecg_values).mean() > 0.5
     ecg_inverted = None
     if have_ecg:
-        ecg_t, _, ecg_inverted = ecg_beats(ecg_values, FS_RAW)
+        ecg_t, ecg_inverted = ecg_beats(ecg_values, FS_RAW)
         ecg_nan = ~np.isfinite(ecg_values)
     else:
         ecg_t, ecg_nan = np.zeros(0), np.ones(len(frame), dtype=bool)
+    times25 = epoch_sample_times(start_s, FS_IBI, EPOCH_IBI)
+    ibi_ecg = ibi_at(times25, ecg_t)
 
     # alignment of wrist PPG to PSG ECG
     alignment = dict(ecg_available=bool(have_ecg), ecg_inverted=ecg_inverted, aligned=False)
@@ -548,28 +649,31 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, threshold
             aligned=bool(track is not None and track["concentration"] >= 0.4 and drift <= 0.2
                          and 0.1 <= track["lag_s"] <= 0.8))
 
-    # beat accuracy against ECG, on ECG beats inside the kept epochs
-    accuracy = {}
+    # accuracy against ECG: beats (inside kept epochs) and the 25 Hz IBI series (lag-aligned)
+    beats, series = {}, {}
     epoch_match = np.zeros(keep.size, dtype=np.float32)
     if track is not None:
         ecg_epoch = np.floor((ecg_t * FS_RAW - grid["offset"]) / EPOCH_ROWS).astype(np.int64)
         inside = np.isin(ecg_epoch, epoch_index)
         ecg_in, position = ecg_t[inside], np.searchsorted(epoch_index, ecg_epoch[inside])
-        matched, accuracy["ppg50_refined"] = beat_accuracy(ecg_in, ppg_t, track)
-        _, accuracy["ppg50_unrefined"] = beat_accuracy(ecg_in, p50["beat_times_unrefined_s"], track)
-        _, accuracy["ppg100_refined"] = beat_accuracy(ecg_in, p100["beat_times_s"], track)
-        _, accuracy["ppg100_unrefined"] = beat_accuracy(ecg_in, p100["beat_times_unrefined_s"], track)
+        matched, beats["ppg50"] = beat_accuracy(ecg_in, ppg_t, track)
+        _, beats["ppg50_unrefined"] = beat_accuracy(ecg_in, join(blocks50, "unrefined_s"), track)
+        _, beats["ppg100"] = beat_accuracy(ecg_in, ppg100_t, track)
+        _, beats["ppg100_unrefined"] = beat_accuracy(ecg_in, join(blocks100, "unrefined_s"), track)
         if wsn_t.size:
             order = np.argsort(wsn_t, kind="stable")
             same_epoch = np.r_[wsn_epoch[order][1:] == wsn_epoch[order][:-1], False]
-            _, accuracy["watchsleepnet"] = beat_accuracy(ecg_in, wsn_t[order], track, pair_ok=same_epoch)
+            _, beats["watchsleepnet"] = beat_accuracy(ecg_in, wsn_t[order], track, pair_ok=same_epoch)
         hits = np.bincount(position, weights=(matched >= 0), minlength=keep.size)
         totals = np.bincount(position, minlength=keep.size)
         epoch_match = np.where(totals > 0, hits / np.maximum(totals, 1), 0.0).astype(np.float32)
+        reference = ibi_at(times25 - lag_at(times25, track), ecg_t)
+        for name, variant in variants.items():
+            series[name] = series_accuracy(variant["ibi"], reference)
+        if watchsleepnet:
+            series["watchsleepnet"] = series_accuracy(ibi_wsn, reference)
 
-    ibi_ecg = ibi_at(epoch_sample_times(start_s, FS_IBI, EPOCH_IBI), ecg_t)[0]
-
-    # quality per epoch (stored for every epoch; thresholds only decide good_epoch)
+    # quality per epoch (stored for every epoch)
     if all(c in frame.columns for c in ("ACC_X", "ACC_Y", "ACC_Z")):
         acc = np.sqrt(sum(np.nan_to_num(frame[c].to_numpy(dtype=np.float64)) ** 2
                           for c in ("ACC_X", "ACC_Y", "ACC_Z"))) / 64.0       # E4 units are 1/64 g
@@ -579,14 +683,8 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, threshold
     flat = np.array([flat_fraction(bvp_raw[s:s + EPOCH_ROWS]) for s in starts], dtype=np.float32)
     bvp_nan_fraction = bvp_nan[rows100].mean(axis=1).astype(np.float32)
     ecg_nan_fraction = ecg_nan[rows100].mean(axis=1).astype(np.float32)
-    sqi = p50["sqi"]
-    good = ((sqi >= thresholds["sqi"]) & (flat <= thresholds["flat_fraction"])
-            & (bvp_nan_fraction <= thresholds["nan_fraction"])
-            & (np.nan_to_num(acc_std, nan=0.0) <= thresholds["acc_std_g"]))
-    if track is not None:
-        good &= epoch_match >= thresholds["ecg_match"]
-
     events = event_flags(frame)[0][rows50]                               # [n, 1500, 4] at 50 Hz
+    status = main["status"]
 
     report = dict(
         subject=csv_path.name.split("_")[0].split(".")[0], csv=csv_path.name, rows=int(len(frame)),
@@ -594,16 +692,17 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, threshold
         stage_changes_on_grid_fraction=grid["on_grid_fraction"], sleep_period_epochs=int(in_sleep.sum()),
         epoch_runs=len(epoch_runs(start_s)),
         stage_epochs={name: int((stages == code).sum()) for name, code in STAGE_CODES.items()},
-        ppg_beats=int(ppg_t.size), ecg_beats=int(ecg_t.size),
-        ppg_artifact_beat_fraction=float(p50["artifact_beats"].mean()) if ppg_t.size else None,
-        alignment=alignment, accuracy=accuracy, thresholds=thresholds,
-        good_epoch_fraction=float(good.mean()),
-        good_epoch_fraction_sleep_period=float(good[in_sleep].mean()) if in_sleep.any() else None,
+        ppg_beats=int(ppg_t.size), ecg_beats=int(ecg_t.size), cleaning=options,
+        relative_threshold=relative_threshold, alignment=alignment, beat_accuracy=beats, series_accuracy=series,
+        epoch_ok_fraction=float(main["epoch_ok"].mean()),
+        epoch_ok_fraction_sleep_period=float(main["epoch_ok"][in_sleep].mean()) if in_sleep.any() else None,
+        epoch_ok_fraction_relative=float(variants["ppg50_relative"]["epoch_ok"].mean()),
+        measured_sample_fraction=float((status == MEASURED).mean()),
+        interpolated_sample_fraction=float((status == INTERPOLATED).mean()),
+        artifact_sample_fraction=float((status == ARTIFACT).mean()),
+        no_beat_sample_fraction=float((status == NO_BEAT).mean()),
         median_sqi=float(np.median(sqi)),
         median_acc_std_g=float(np.nanmedian(acc_std)) if np.isfinite(acc_std).any() else None,
-        ppg_ibi_zero_fraction=float((p50["ibi"] == 0).mean()),
-        ecg_ibi_zero_fraction=float((ibi_ecg == 0).mean()),
-        wsn_ibi_zero_fraction=float((ibi_wsn == 0).mean()) if watchsleepnet else None,
         event_sample_fraction=float(events.max(axis=2).mean()), participant_ahi=None if ahi is None else float(ahi),
     )
     arrays = dict(
@@ -612,12 +711,15 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, threshold
         epoch_seconds=np.array(EPOCH_SECONDS), grid_offset_rows=np.array(grid["offset"]),
         epoch_index=epoch_index, epoch_start_s=start_s, stages=stages.astype(np.int8), in_sleep_period=in_sleep,
         ppg=ppg, events=events, event_columns=np.array(EVENT_COLUMNS),
-        ppg_peaks_s=ppg_t, ppg_artifact_beats=p50["artifact_beats"], ppg100_peaks_s=p100["beat_times_s"],
-        ecg_peaks_s=ecg_t, wsn_peaks_s=np.sort(wsn_t),
-        ibi_ppg=p50["ibi"], ibi_ppg_flag=p50["ibi_flag"], ibi_ecg=ibi_ecg, ibi_wsn=ibi_wsn,
+        ibi_ppg=main["ibi"], ibi_ppg_status=status, ibi_ppg_valid_fraction=main["valid_fraction"],
+        epoch_ok=main["epoch_ok"],
+        ibi_ppg_relative=variants["ppg50_relative"]["ibi"],
+        ibi_ppg_relative_valid_fraction=variants["ppg50_relative"]["valid_fraction"],
+        ibi_ppg_raw=variants["ppg50_raw"]["ibi"], ibi_ppg100=variants["ppg100_clean"]["ibi"],
+        ibi_wsn=ibi_wsn, ibi_ecg=ibi_ecg,
+        ppg_peaks_s=ppg_t, ppg100_peaks_s=ppg100_t, ecg_peaks_s=ecg_t, wsn_peaks_s=np.sort(wsn_t),
         sqi=sqi, acc_std_g=acc_std, flat_fraction=flat, bvp_nan_fraction=bvp_nan_fraction,
-        ecg_nan_fraction=ecg_nan_fraction, ecg_match_fraction=epoch_match,
-        ppg_beats_per_epoch=p50["beats_per_epoch"], good_epoch=good,
+        ecg_nan_fraction=ecg_nan_fraction, ecg_match_fraction=epoch_match, ppg_beats_per_epoch=beats_per_epoch,
         report=np.array(json.dumps(report, allow_nan=True)),
     )
     return arrays, report
