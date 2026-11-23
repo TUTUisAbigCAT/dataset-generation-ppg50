@@ -15,14 +15,17 @@ PPG -> IBI (ppg_to_ibi; identical for real and generated PPG):
      samples valid (measured or filled) gets epoch_ok = False (zero it or mask it in the loss).
 
 Extraction of one participant (extract_subject) builds on the PSG 30-s grid:
-  * PPG: E4 BVP band-passed 0.5-8 Hz on the whole night (zero phase), anti-aliased to 50 Hz,
-    stored per epoch [n, 1500] and not normalized;
+  * PPG: the E4 BVP anti-aliased to 50 Hz and nothing else, stored per epoch [n, 1500], not normalized
+    (nk.ppg_clean in the PPG -> IBI path is then the only band-pass, as on the raw 100 Hz BVP);
   * stages (W=0, N1=1, N2=2, N3=3, R=4) and respiratory events at 50 Hz;
   * IBI from the stored 50 Hz PPG with the path above (the one generated PPG will take), the same
     with the extra relative rule, without any filling, from the raw 100 Hz BVP (the teacher's
     original route), with WatchSleepNet's per-epoch method, and from the PSG ECG (reference);
-  * PPG-to-ECG lag and its drift, beat sensitivity/PPV and errors of every IBI variant against
-    the ECG IBI, and per-epoch quality (template SQI, wrist motion, flat and missing fractions).
+  * the PPG-to-ECG lag tracked beat by beat (in DREAMT the E4 clock drifts and wanders against the PSG
+    by up to seconds), beat sensitivity/PPV and errors of every IBI variant against the lag-aligned ECG
+    IBI, an ECG rhythm flag (e.g. bigeminy, where wrist pulses do not follow ECG beats), the agreement
+    of the 50 Hz and 100 Hz routes on the same clock, and per-epoch quality (template SQI, wrist
+    motion, flat and missing fractions).
 Raw CSVs are only read; flags never remove anything from the stored arrays.
 """
 from __future__ import annotations
@@ -384,61 +387,188 @@ def hr_cross_lag(ecg_t, ppg_t, *, max_lag_s=60.0, fs=10.0):
     return float(lags[best]), float(corr[best])
 
 
-def pulse_arrival(ecg_t, ppg_t, *, max_s=1.0):
-    """Delay from each PPG beat back to the preceding R peak (0 < d < max_s) and the PPG beat time."""
-    if ecg_t.size == 0 or ppg_t.size == 0:
-        return np.zeros(0), np.zeros(0)
-    index = np.searchsorted(ecg_t, ppg_t, side="right") - 1
-    ok = index >= 0
-    delay = ppg_t[ok] - ecg_t[index[ok]]
-    keep = (delay > 0) & (delay < max_s)
-    return delay[keep], ppg_t[ok][keep]
+def _nearest(sorted_t, target):
+    """(index, distance) of the value in sorted_t closest to target (-1, inf if empty)."""
+    r = int(np.searchsorted(sorted_t, target))
+    best, gap = -1, np.inf
+    for q in (r - 1, r):
+        if 0 <= q < sorted_t.size and abs(target - sorted_t[q]) < gap:
+            best, gap = q, abs(target - sorted_t[q])
+    return best, gap
 
 
-def mode_lag(lags, *, width=0.05, bin_s=0.01):
-    """(estimate, concentration): the densest lag (10-ms histogram) refined by the median near it."""
-    lags = np.asarray(lags, dtype=np.float64)
-    if lags.size < 50:
-        return None, 0.0
-    counts, edges = np.histogram(lags, np.arange(lags.min(), lags.max() + 2 * bin_s, bin_s))
-    peak = edges[int(np.argmax(np.convolve(counts, np.ones(5), mode="same")))] + bin_s / 2
-    estimate = float(np.median(lags[np.abs(lags - peak) <= width]))
-    return estimate, float(np.mean(np.abs(lags - estimate) <= width))
+def track_beats(ecg_t, ppg_t, *, priors=(0.3,), window=0.2, alpha=0.3, beta=0.1, confirm=5, look_ahead=8,
+                reacquire_after=8, max_rate=0.03, centre=None, max_dev=None):
+    """Follow a slowly changing PPG-minus-ECG lag beat by beat (E4 and PSG clocks drift and wander).
 
+    A track starts at a PPG beat by trying, for every prior lag, the shift of whole RR intervals that
+    brings the beat closest to that prior, and is accepted when at least `confirm` of the next
+    `look_ahead` PPG beats also land within `window` of an R peak. While tracking, each PPG beat is
+    paired with the R peak nearest to (beat - predicted lag) within `window`; lag and its rate of change
+    follow the observed delay as an alpha-beta filter (gains `alpha`, `beta`), so steady ramps are
+    followed without lag (the rate is limited to `max_rate` s per s; the largest wander seen in DREAMT
+    is about 1 s per minute); after more than `reacquire_after` misses, or once the lag leaves
+    `centre` +- `max_dev`, the track is restarted (beats are nearly periodic, so a track can otherwise
+    slide from beat to beat and run away).
+    Finally every continuous run is shifted by up to two beats to the ECG assignment whose RR
+    intervals best match the PP intervals (the clock offset itself cannot tell beats apart).
 
-def lag_track(ecg_t, ppg_t, *, coarse=None, block_s=1800.0, min_beats=300):
-    """PPG-minus-ECG beat lag: whole-night estimate, concentration and a 30-min track.
-
-    Each PPG beat is paired with the last R peak before it after shifting ECG by a base lag; two
-    bases are tried (-0.2 s for an aligned recording, coarse - 0.5 s from the heart-rate
-    cross-correlation) and the one whose lags concentrate best is kept.
+    Returns dict(matched=ECG index per PPG beat or -1, lag=PPG minus matched R (s) or NaN, run=run id or -1).
     """
-    best = None
-    for base in sorted({-0.2} | ({round(coarse - 0.5, 3)} if coarse is not None else set())):
-        delays, at = pulse_arrival(ecg_t + base, ppg_t)
-        estimate, concentration = mode_lag(base + delays)
-        if estimate is not None and (best is None or concentration > best[1]):
-            best = (estimate, concentration, base + delays, at, base)
+    ecg_t = np.asarray(ecg_t, dtype=np.float64)
+    ppg_t = np.asarray(ppg_t, dtype=np.float64)
+    n = ppg_t.size
+    matched = np.full(n, -1, dtype=np.int64)
+    run = np.full(n, -1, dtype=np.int64)
+    if ecg_t.size < 3 or n < 3:
+        return dict(matched=matched, lag=np.full(n, np.nan), run=run)
+    lag, rate, last, misses, run_id = None, 0.0, 0.0, 0, -1
+    for i in range(n):
+        p = ppg_t[i]
+        if lag is None:
+            k = int(np.searchsorted(ecg_t, p, side="right")) - 1
+            if k < 1:
+                continue
+            rr = ecg_t[k] - ecg_t[k - 1]
+            if not IBI_RANGE[0] <= rr < IBI_RANGE[1]:
+                continue
+            base = p - ecg_t[k]
+            best, best_hits = None, -1
+            for prior in priors:
+                trial = base - np.round((base - prior) / rr) * rr
+                hits = sum(_nearest(ecg_t, ppg_t[j] - trial)[1] <= window
+                           for j in range(i + 1, min(i + 1 + look_ahead, n)))
+                if hits > best_hits:
+                    best, best_hits = trial, hits
+            if best_hits < confirm:
+                continue
+            lag, rate, last, misses, run_id = best, 0.0, p, 0, run_id + 1
+        predicted = lag + rate * (p - last)
+        q, gap = _nearest(ecg_t, p - predicted)
+        if gap <= window:
+            matched[i], run[i] = q, run_id
+            step = max(p - last, 1e-3)
+            innovation = (p - ecg_t[q]) - predicted
+            lag = predicted + alpha * innovation
+            rate = float(np.clip(rate + beta * innovation / step, -max_rate, max_rate))
+            last, misses = p, 0
+            if centre is not None and max_dev is not None and abs(lag - centre) > max_dev:
+                lag = None
+        else:
+            misses += 1
+            if misses > reacquire_after:
+                lag = None
+    for r in np.unique(run[run >= 0]):
+        index = np.flatnonzero(run == r)
+        if index.size < 10:
+            continue
+        best_shift, best_error = 0, np.inf
+        for shift in (-2, -1, 0, 1, 2):
+            m = matched[index] + shift
+            if m.min() < 0 or m.max() >= ecg_t.size:
+                continue
+            pairs = np.flatnonzero((index[1:] == index[:-1] + 1) & (m[1:] == m[:-1] + 1))
+            if pairs.size < 5:
+                continue
+            pp = ppg_t[index[pairs + 1]] - ppg_t[index[pairs]]
+            rr = ecg_t[m[pairs + 1]] - ecg_t[m[pairs]]
+            error = float(np.median(np.abs(pp - rr)))
+            if error < best_error - 1e-9:
+                best_shift, best_error = shift, error
+        matched[index] += best_shift
+    lag_out = np.full(n, np.nan)
+    hit = matched >= 0
+    lag_out[hit] = ppg_t[hit] - ecg_t[matched[hit]]
+    return dict(matched=matched, lag=lag_out, run=run)
+
+
+def align_beats(ecg_t, ppg_t, *, coarse=None, max_dev=4.0, min_pairs=100):
+    """Two-pass tracking: find the night's typical lag, then track around it.
+
+    Pass 1 tracks from a 0.3 s prior and, if the heart-rate cross-correlation suggests a large offset,
+    from that offset too; the one whose PP intervals follow the RR intervals best (median |PP - RR|)
+    gives the centre (the median tracked lag). Pass 2 tracks with every run kept within centre +- max_dev.
+    Returns (track, centre); centre is None when nothing could be tracked.
+    """
+    candidates = [0.3] + ([float(coarse)] if coarse is not None and abs(coarse - 0.3) > 1.0 else [])
+    best, best_score = None, np.inf
+    for prior in candidates:
+        track = track_beats(ecg_t, ppg_t, priors=(prior,))
+        accuracy = tracked_accuracy(ecg_t, ppg_t, track)
+        score = accuracy["median_abs_ms"] if accuracy["pairs"] >= min_pairs else np.inf
+        if score < best_score:
+            best, best_score = track, score
     if best is None:
-        return dict(lag_s=None, concentration=0.0, track_t=[], track_lag_s=[], base_s=None)
-    estimate, concentration, lags, at, base = best
-    track_t, track = [], []
-    near = np.abs(lags - estimate) <= 0.3
-    for lo in np.arange(at.min(), at.max() + 1e-9, block_s):
-        inside = near & (at >= lo) & (at < lo + block_s)
-        if inside.sum() >= min_beats:
-            block, block_concentration = mode_lag(lags[inside])
-            if block is not None and block_concentration >= 0.3:
-                track_t.append(float(lo + block_s / 2))
-                track.append(block)
-    return dict(lag_s=estimate, concentration=concentration, track_t=track_t, track_lag_s=track, base_s=base)
+        return track_beats(ecg_t, ppg_t, priors=(0.3,), centre=0.3, max_dev=max_dev), None
+    centre = float(np.median(best["lag"][best["matched"] >= 0]))
+    return track_beats(ecg_t, ppg_t, priors=(centre,), centre=centre, max_dev=max_dev), centre
 
 
-def lag_at(times, track):
-    """Lag (s) at the given times from lag_track's result (constant outside the track)."""
-    if track["track_t"]:
-        return np.interp(np.asarray(times, dtype=np.float64), track["track_t"], track["track_lag_s"])
-    return np.full(np.shape(times), track["lag_s"], dtype=np.float64)
+def lag_series(times, ppg_t, track, *, max_gap_s=5.0):
+    """Lag at arbitrary times, interpolated between matched beats of the same run (NaN elsewhere)."""
+    times = np.asarray(times, dtype=np.float64)
+    hit = track["matched"] >= 0
+    t, lag, run = np.asarray(ppg_t, dtype=np.float64)[hit], track["lag"][hit], track["run"][hit]
+    out = np.full(times.shape, np.nan)
+    if t.size < 2:
+        return out
+    k = np.searchsorted(t, times)
+    left, right = np.clip(k - 1, 0, t.size - 1), np.clip(k, 0, t.size - 1)
+    ok = (k > 0) & (k < t.size) & (run[left] == run[right]) & (t[right] - t[left] <= max_gap_s)
+    span = np.where(t[right] > t[left], t[right] - t[left], 1.0)
+    weight = (times - t[left]) / span
+    out[ok] = (lag[left] + weight * (lag[right] - lag[left]))[ok]
+    return out
+
+
+def tracked_accuracy(ecg_t, ppg_t, track, *, ecg_inside=None, pair_ok=None):
+    """Beat metrics of a tracked PPG beat sequence against ECG."""
+    matched = track["matched"]
+    ecg_inside = np.ones(ecg_t.size, dtype=bool) if ecg_inside is None else ecg_inside
+    covered = np.zeros(ecg_t.size, dtype=bool)
+    covered[matched[matched >= 0]] = True
+    pairs = np.flatnonzero((matched[:-1] >= 0) & (matched[1:] >= 0) & (matched[1:] == matched[:-1] + 1))
+    if pair_ok is not None:
+        pairs = pairs[pair_ok[pairs]]
+    rr = ecg_t[matched[pairs + 1]] - ecg_t[matched[pairs]]
+    pp = ppg_t[pairs + 1] - ppg_t[pairs]
+    keep = (rr >= IBI_RANGE[0]) & (rr < IBI_RANGE[1])
+    lag = track["lag"][matched >= 0]
+    return dict(sensitivity=float(covered[ecg_inside].mean()) if ecg_inside.any() else None,
+                ppv=float((matched >= 0).mean()) if matched.size else None,
+                lag_median_s=float(np.median(lag)) if lag.size else None,
+                **error_summary(pp[keep] - rr[keep]))
+
+
+def ecg_rhythm(ecg_t, *, jump=0.3):
+    """Share of consecutive RR intervals that change by more than `jump` (relative).
+
+    Sinus rhythm in sleep stays well below 0.1; ventricular bigeminy (short-long pairs) is close to 1,
+    and then wrist pulses do not follow ECG beats, so ECG is no reference for PPG beats.
+    """
+    rr = np.diff(np.asarray(ecg_t, dtype=np.float64))
+    ok = (rr[1:] >= IBI_RANGE[0]) & (rr[1:] < IBI_RANGE[1]) & (rr[:-1] >= IBI_RANGE[0]) & (rr[:-1] < IBI_RANGE[1])
+    if not ok.any():
+        return None
+    ratio = rr[1:][ok] / rr[:-1][ok]
+    return float(np.mean((ratio < 1 - jump) | (ratio > 1 / (1 - jump))))
+
+
+def route_agreement(reference_t, other_t, *, tolerance=0.05):
+    """Beats of two PPG routes on the same clock (e.g. 50->100 Hz against the raw 100 Hz BVP)."""
+    reference_t = np.asarray(reference_t, dtype=np.float64)
+    other_t = np.asarray(other_t, dtype=np.float64)
+    matched = match_beats(reference_t, other_t, 0.0, tolerance=tolerance)
+    hit = matched >= 0
+    if not hit.any():
+        return dict(reference_matched=0.0, other_matched=0.0, dt_median_abs_ms=None, dt_p95_abs_ms=None,
+                    ibi_median_abs_ms=None, ibi_p95_abs_ms=None)
+    dt = np.abs(other_t[matched[hit]] - reference_t[hit]) * 1000.0
+    errors = np.abs(ibi_errors(reference_t, other_t, matched)) * 1000.0
+    return dict(reference_matched=float(hit.mean()), other_matched=float(np.unique(matched[hit]).size / other_t.size),
+                dt_median_abs_ms=float(np.median(dt)), dt_p95_abs_ms=float(np.quantile(dt, 0.95)),
+                ibi_median_abs_ms=float(np.median(errors)) if errors.size else None,
+                ibi_p95_abs_ms=float(np.quantile(errors, 0.95)) if errors.size else None)
 
 
 def match_beats(ecg_t, ppg_t, lag, *, tolerance=0.15):
@@ -483,15 +613,6 @@ def error_summary(errors):
     absolute = np.abs(errors) * 1000.0
     return dict(pairs=int(errors.size), mae_ms=float(absolute.mean()), median_abs_ms=float(np.median(absolute)),
                 bias_ms=float(errors.mean() * 1000.0), p95_abs_ms=float(np.quantile(absolute, 0.95)))
-
-
-def beat_accuracy(ecg_t, beats, track, *, pair_ok=None):
-    """(matched, metrics) of PPG beats against ECG R peaks shifted by the lag track."""
-    matched = match_beats(ecg_t, beats, lag_at(ecg_t, track))
-    metrics = dict(sensitivity=float((matched >= 0).mean()) if matched.size else None,
-                   ppv=float(np.unique(matched[matched >= 0]).size / beats.size) if beats.size else None,
-                   **error_summary(ibi_errors(ecg_t, beats, matched, pair_ok=pair_ok)))
-    return matched, metrics
 
 
 def series_accuracy(ibi, reference, *, big_error_s=0.1):
@@ -565,7 +686,7 @@ def read_subject_csv(csv_path, ecg_column="ECG"):
 def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=None,
                     relative_threshold=DEFAULT_RELATIVE_THRESHOLD, ahi=None):
     """Return (arrays, report) for one raw DREAMT CSV; see the module docstring."""
-    from scipy.signal import butter, resample_poly, sosfiltfilt
+    from scipy.signal import resample_poly
 
     from apnea_labels import event_flags
 
@@ -587,12 +708,12 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=
     if sleep.size:
         in_sleep[sleep[0]:sleep[-1] + 1] = True
 
-    # stored PPG: whole-night zero-phase 0.5-8 Hz band-pass at 100 Hz, anti-aliased 2:1 on the epoch phase
+    # stored PPG: the E4 BVP anti-aliased 2:1 to 50 Hz on the epoch phase, nothing else (nk.ppg_clean in
+    # the PPG -> IBI path does the band-pass, once, exactly as on the raw 100 Hz BVP)
     bvp_raw = frame["BVP"].to_numpy(dtype=np.float64)
     bvp, bvp_nan = _fill_nan(bvp_raw)
-    filtered = sosfiltfilt(butter(3, [0.5, 8.0], btype="bandpass", fs=FS_RAW, output="sos"), bvp)
     phase = grid["offset"] % 2
-    ppg50 = resample_poly(filtered[phase:], 1, 2)                          # sample m sits on row phase + 2m
+    ppg50 = resample_poly(bvp[phase:], 1, 2)                               # sample m sits on row phase + 2m
     take50 = (rows50 - phase) // 2
     if take50.max() >= ppg50.size:
         raise ValueError(f"{csv_path.name}: 50 Hz signal shorter than the last epoch")
@@ -631,47 +752,56 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=
     times25 = epoch_sample_times(start_s, FS_IBI, EPOCH_IBI)
     ibi_ecg = ibi_at(times25, ecg_t)
 
-    # alignment of wrist PPG to PSG ECG
-    alignment = dict(ecg_available=bool(have_ecg), ecg_inverted=ecg_inverted, aligned=False)
-    track = None
-    if have_ecg and ecg_t.size > 100 and ppg_t.size > 100:
-        coarse, coarse_r = hr_cross_lag(ecg_t, ppg_t)
-        track = lag_track(ecg_t, ppg_t, coarse=coarse)
-        lags = track["track_lag_s"]
-        drift = float(max(lags) - min(lags)) if len(lags) >= 2 else 0.0
-        if track["lag_s"] is None:
-            track = None
-        alignment.update(
-            coarse_hr_lag_s=coarse, coarse_hr_corr=coarse_r,
-            pulse_arrival_s=None if track is None else track["lag_s"],
-            pulse_arrival_concentration=0.0 if track is None else track["concentration"],
-            lag_track_t_s=[] if track is None else track["track_t"], lag_track_s=lags, pulse_arrival_drift_s=drift,
-            aligned=bool(track is not None and track["concentration"] >= 0.4 and drift <= 0.2
-                         and 0.1 <= track["lag_s"] <= 0.8))
-
-    # accuracy against ECG: beats (inside kept epochs) and the 25 Hz IBI series (lag-aligned)
+    # wrist PPG against PSG ECG: the lag drifts and wanders, so it is tracked beat by beat
+    alignment = dict(ecg_available=bool(have_ecg), ecg_inverted=ecg_inverted)
     beats, series = {}, {}
     epoch_match = np.zeros(keep.size, dtype=np.float32)
-    if track is not None:
-        ecg_epoch = np.floor((ecg_t * FS_RAW - grid["offset"]) / EPOCH_ROWS).astype(np.int64)
-        inside = np.isin(ecg_epoch, epoch_index)
-        ecg_in, position = ecg_t[inside], np.searchsorted(epoch_index, ecg_epoch[inside])
-        matched, beats["ppg50"] = beat_accuracy(ecg_in, ppg_t, track)
-        _, beats["ppg50_unrefined"] = beat_accuracy(ecg_in, join(blocks50, "unrefined_s"), track)
-        _, beats["ppg100"] = beat_accuracy(ecg_in, ppg100_t, track)
-        _, beats["ppg100_unrefined"] = beat_accuracy(ecg_in, join(blocks100, "unrefined_s"), track)
-        if wsn_t.size:
-            order = np.argsort(wsn_t, kind="stable")
-            same_epoch = np.r_[wsn_epoch[order][1:] == wsn_epoch[order][:-1], False]
-            _, beats["watchsleepnet"] = beat_accuracy(ecg_in, wsn_t[order], track, pair_ok=same_epoch)
-        hits = np.bincount(position, weights=(matched >= 0), minlength=keep.size)
+    ecg_epoch = np.floor((ecg_t * FS_RAW - grid["offset"]) / EPOCH_ROWS).astype(np.int64)
+    ecg_inside = np.isin(ecg_epoch, epoch_index)
+    rhythm = ecg_rhythm(ecg_t[ecg_inside]) if have_ecg else None
+    alignment.update(ecg_rr_jump_fraction=rhythm, ecg_irregular=bool(rhythm is not None and rhythm > 0.2))
+    if have_ecg and ecg_t.size > 100 and ppg_t.size > 100:
+        coarse, coarse_r = hr_cross_lag(ecg_t, ppg_t)
+        _, centre = align_beats(ecg_t, ppg_t, coarse=coarse)
+        track_options = dict(priors=(0.3 if centre is None else centre,), centre=0.3 if centre is None else centre,
+                             max_dev=4.0)
+        order = np.argsort(wsn_t, kind="stable")
+        wsn_sorted = wsn_t[order]
+        same_epoch = np.r_[wsn_epoch[order][1:] == wsn_epoch[order][:-1], False]
+        routes = dict(ppg50=(ppg_t, None), ppg50_unrefined=(join(blocks50, "unrefined_s"), None),
+                      ppg100=(ppg100_t, None), ppg100_unrefined=(join(blocks100, "unrefined_s"), None))
+        if wsn_sorted.size:
+            routes["watchsleepnet"] = (wsn_sorted, same_epoch)
+        tracks = {}
+        for name, (route_t, pair_ok) in routes.items():
+            tracks[name] = track_beats(ecg_t, route_t, **track_options)
+            beats[name] = tracked_accuracy(ecg_t, route_t, tracks[name], ecg_inside=ecg_inside, pair_ok=pair_ok)
+        track = tracks["ppg50"]
+        lag = track["lag"][track["matched"] >= 0]
+        at = ppg_t[track["matched"] >= 0]
+        hours = np.floor(at / 3600.0)
+        alignment.update(
+            coarse_hr_lag_s=coarse, coarse_hr_corr=coarse_r, lag_centre_s=centre,
+            tracked_fraction=float((track["matched"] >= 0).mean()),
+            lag_median_s=float(np.median(lag)) if lag.size else None,
+            lag_p5_s=float(np.quantile(lag, 0.05)) if lag.size else None,
+            lag_p95_s=float(np.quantile(lag, 0.95)) if lag.size else None,
+            lag_hourly_median_s={int(h): float(np.median(lag[hours == h])) for h in np.unique(hours)
+                                 if (hours == h).sum() >= 100})
+        covered = np.zeros(ecg_t.size, dtype=bool)
+        covered[track["matched"][track["matched"] >= 0]] = True
+        position = np.searchsorted(epoch_index, ecg_epoch[ecg_inside])
+        hits = np.bincount(position, weights=covered[ecg_inside], minlength=keep.size)
         totals = np.bincount(position, minlength=keep.size)
         epoch_match = np.where(totals > 0, hits / np.maximum(totals, 1), 0.0).astype(np.float32)
-        reference = ibi_at(times25 - lag_at(times25, track), ecg_t)
+        shift = lag_series(times25, ppg_t, track)
+        reference = np.where(np.isfinite(shift), ibi_at(times25 - np.nan_to_num(shift), ecg_t), 0.0)
         for name, variant in variants.items():
             series[name] = series_accuracy(variant["ibi"], reference)
         if watchsleepnet:
             series["watchsleepnet"] = series_accuracy(ibi_wsn, reference)
+        series["reference_coverage"] = float((reference > 0).mean())
+    agreement = route_agreement(ppg100_t, ppg_t)
 
     # quality per epoch (stored for every epoch)
     if all(c in frame.columns for c in ("ACC_X", "ACC_Y", "ACC_Z")):
@@ -692,8 +822,9 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=
         stage_changes_on_grid_fraction=grid["on_grid_fraction"], sleep_period_epochs=int(in_sleep.sum()),
         epoch_runs=len(epoch_runs(start_s)),
         stage_epochs={name: int((stages == code).sum()) for name, code in STAGE_CODES.items()},
-        ppg_beats=int(ppg_t.size), ecg_beats=int(ecg_t.size), cleaning=options,
+        ppg_beats=int(ppg_t.size), ppg100_beats=int(ppg100_t.size), ecg_beats=int(ecg_t.size), cleaning=options,
         relative_threshold=relative_threshold, alignment=alignment, beat_accuracy=beats, series_accuracy=series,
+        route_agreement_50_vs_100=agreement,
         epoch_ok_fraction=float(main["epoch_ok"].mean()),
         epoch_ok_fraction_sleep_period=float(main["epoch_ok"][in_sleep].mean()) if in_sleep.any() else None,
         epoch_ok_fraction_relative=float(variants["ppg50_relative"]["epoch_ok"].mean()),

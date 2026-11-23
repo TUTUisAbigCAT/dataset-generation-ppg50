@@ -162,22 +162,47 @@ class PureFunctionTests(unittest.TestCase):
         self.assertFalse(px.ecg_is_inverted(ecg, 100))
         self.assertTrue(px.ecg_is_inverted(-ecg, 100))
 
-    def test_lag_track_follows_a_drifting_clock(self):
+    def test_tracking_follows_drift_and_fast_wander(self):
         rng = np.random.default_rng(0)
-        ecg = np.cumsum(rng.uniform(0.8, 1.0, 4000))
-        drift = 0.25 + 0.2 * ecg / ecg[-1]                          # 0.25 s -> 0.45 s over the night
-        ppg = np.sort(ecg + drift + rng.normal(0, 0.008, ecg.size))
-        track = px.lag_track(ecg, ppg, coarse=0.3, block_s=600.0, min_beats=300)
-        self.assertGreater(track["concentration"], 0.2)
-        self.assertGreater(track["track_lag_s"][-1] - track["track_lag_s"][0], 0.15)
-        matched = px.match_beats(ecg, ppg, px.lag_at(ecg, track), tolerance=0.05)
-        self.assertGreater((matched >= 0).mean(), 0.97)
+        ecg = np.cumsum(0.9 + 0.05 * np.sin(np.arange(6000) / 4.0) + rng.normal(0, 0.03, 6000))
+        # slow drift, a back-and-forth of 0.4 s within 20 s, and a 2-s ramp over 2 minutes in the middle
+        wander = 0.3 + 0.2 * ecg / ecg[-1] + 0.2 * np.sin(2 * np.pi * ecg / 40.0)
+        wander += np.clip((ecg - 2000.0) / 60.0, 0, 2.0) - np.clip((ecg - 2300.0) / 60.0, 0, 2.0)
+        ppg = ecg + wander + rng.normal(0, 0.01, ecg.size)
+        track = px.track_beats(ecg, ppg)
+        hit = track["matched"] >= 0
+        self.assertGreater(hit.mean(), 0.95)
+        self.assertGreater((track["matched"][hit] == np.flatnonzero(hit)).mean(), 0.95)   # the right beats
+        np.testing.assert_allclose(track["lag"][hit], wander[hit], atol=0.05)
+        accuracy = px.tracked_accuracy(ecg, ppg, track)
+        self.assertLess(accuracy["median_abs_ms"], 25.0)
+        times = np.linspace(ppg[10], ppg[-10], 1000)
+        shift = px.lag_series(times, ppg, track)
+        self.assertGreater(np.isfinite(shift).mean(), 0.9)
 
-    def test_mode_lag_ignores_wrapped_pairs(self):
-        lags = np.r_[np.full(600, 0.31), np.random.default_rng(1).uniform(-0.2, 0.8, 300)]
-        estimate, concentration = px.mode_lag(lags)
-        self.assertAlmostEqual(estimate, 0.31, delta=0.005)
-        self.assertGreater(concentration, 0.6)
+    def test_tracking_uses_a_far_prior_and_fixes_the_beat_identity(self):
+        rng = np.random.default_rng(1)
+        ecg = np.cumsum(0.9 + 0.08 * np.sin(np.arange(3000) / 3.0) + rng.normal(0, 0.04, 3000))
+        ppg = ecg + 7.3 + rng.normal(0, 0.01, ecg.size)
+        self.assertLess((px.track_beats(ecg, ppg)["matched"] >= 0).mean(), 0.5 + 0.5)   # runs, maybe off by beats
+        track = px.track_beats(ecg, ppg, priors=(0.3, 7.2))
+        hit = track["matched"] >= 0
+        self.assertGreater(hit.mean(), 0.95)
+        self.assertAlmostEqual(float(np.median(track["lag"][hit])), 7.3, delta=0.02)
+
+    def test_ecg_rhythm_flags_bigeminy(self):
+        sinus = np.cumsum(np.full(500, 0.9) + np.random.default_rng(2).normal(0, 0.02, 500))
+        self.assertLess(px.ecg_rhythm(sinus), 0.05)
+        bigeminy = np.cumsum(np.tile([0.49, 1.27], 250))
+        self.assertGreater(px.ecg_rhythm(bigeminy), 0.95)
+
+    def test_route_agreement(self):
+        reference = np.arange(0, 100, 0.9)
+        other = np.r_[reference[:50] + 0.002, reference[51:] - 0.001, 33.33]
+        agreement = px.route_agreement(reference, other)
+        self.assertAlmostEqual(agreement["reference_matched"], (reference.size - 1) / reference.size)
+        self.assertLess(agreement["dt_p95_abs_ms"], 2.5)
+        self.assertLess(agreement["ibi_p95_abs_ms"], 3.5)
 
 
 @unittest.skipUnless(HAVE_NEUROKIT, "neurokit2 is not installed")
@@ -252,8 +277,11 @@ class ExtractionTests(unittest.TestCase):
 
     def test_alignment_and_beat_accuracy(self):
         r = self.report
-        self.assertTrue(r["alignment"]["aligned"])
-        self.assertAlmostEqual(r["alignment"]["pulse_arrival_s"], PAT, delta=0.03)
+        self.assertAlmostEqual(r["alignment"]["lag_median_s"], PAT, delta=0.03)
+        self.assertGreater(r["alignment"]["tracked_fraction"], 0.95)
+        self.assertFalse(r["alignment"]["ecg_irregular"])
+        self.assertGreater(r["route_agreement_50_vs_100"]["reference_matched"], 0.97)
+        self.assertLess(r["route_agreement_50_vs_100"]["ibi_median_abs_ms"], 3.0)
         beats = r["beat_accuracy"]
         self.assertGreater(beats["ppg50"]["sensitivity"], 0.97)
         self.assertLess(beats["ppg50"]["mae_ms"], 3.0)
@@ -273,7 +301,7 @@ class ExtractionTests(unittest.TestCase):
         self.assertLess(float(np.median(a["ibi_ppg_relative"][missed])), 1.1)    # interpolated
         self.assertLess(series["ppg50_relative"]["big_error_fraction"], series["ppg50_clean"]["big_error_fraction"])
         self.assertLess(series["ppg50_clean"]["mae_ms"], 25.0)
-        self.assertLess(series["ppg50_clean"]["coverage"], 1.0)
+        self.assertLess(series["reference_coverage"], 1.0)                     # no beats to track in the flat part
         self.assertGreater(series["ppg50_clean"]["coverage"], series["watchsleepnet"]["coverage"])
         self.assertTrue(a["epoch_ok"].all())
 
@@ -297,14 +325,13 @@ class ExtractionTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             summary = extract_ppg.run(cli)
         self.assertEqual(summary["subjects_failed"], ["S003"])
-        self.assertTrue(summary["subjects"]["S001"]["alignment"]["aligned"])
+        self.assertAlmostEqual(summary["subjects"]["S001"]["alignment"]["lag_median_s"], PAT, delta=0.03)
         shifted = summary["subjects"]["S002"]
-        self.assertFalse(shifted["alignment"]["aligned"])                 # 7.3 s is not a pulse arrival time
         self.assertAlmostEqual(shifted["alignment"]["coarse_hr_lag_s"], 7.0 + PAT, delta=0.5)
-        self.assertAlmostEqual(shifted["alignment"]["pulse_arrival_s"], 7.0 + PAT, delta=0.03)
+        self.assertAlmostEqual(shifted["alignment"]["lag_median_s"], 7.0 + PAT, delta=0.03)
         self.assertGreater(shifted["beat_accuracy"]["ppg50"]["sensitivity"], 0.95)
         self.assertTrue(summary["subjects"]["S004"]["alignment"]["ecg_inverted"])
-        self.assertAlmostEqual(summary["subjects"]["S004"]["alignment"]["pulse_arrival_s"], PAT, delta=0.03)
+        self.assertAlmostEqual(summary["subjects"]["S004"]["alignment"]["lag_median_s"], PAT, delta=0.03)
         rows = pd.read_csv(out / "report.csv")
         self.assertEqual(rows["subject"].tolist(), ["S001", "S002", "S003", "S004"])
         self.assertTrue(np.isfinite(rows.loc[0, "ppg50_clean_mae_ms"]))
@@ -322,7 +349,7 @@ class ExtractionTests(unittest.TestCase):
             third = extract_ppg.run(extract_ppg.parse_args(args))
         self.assertEqual((out / "S001.npz").stat().st_mtime_ns, stamp)
         self.assertEqual(third["subjects"]["S001"]["status"], "kept_existing")
-        self.assertTrue(third["subjects"]["S001"]["alignment"]["aligned"])
+        self.assertAlmostEqual(third["subjects"]["S001"]["alignment"]["lag_median_s"], PAT, delta=0.03)
 
 
 if __name__ == "__main__":

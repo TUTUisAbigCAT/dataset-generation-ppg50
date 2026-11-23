@@ -155,15 +155,27 @@ def main(argv=None):
     near = delay < 2.0
     sleep_epochs = np.flatnonzero(z["stages"] > 0)
     centre = z["epoch_start_s"][sleep_epochs[sleep_epochs.size // 2]] if sleep_epochs.size else at.mean()
+    coarse, _ = px.hr_cross_lag(ecg_t, ppg100)
+    track, lag_centre = px.align_beats(ecg_t, ppg100, coarse=coarse)
+    tracked = track["matched"] >= 0
     for column, (lo, hi, label) in enumerate(((at.min(), at.max(), "whole night"),
                                               (centre - 300, centre + 300, "10 min in mid-sleep"))):
         ax = fig.add_subplot(grid[2, column])
         m = near & (at >= lo) & (at <= hi)
-        ax.axhspan(0.2, 0.4, color=INK, alpha=0.08, linewidth=0)
         scale = 3600.0 if column == 0 else 60.0
-        ax.plot(at[m] / scale, delay[m], ".", markersize=1 if column == 0 else 3, color=BLUE)
-        ax.set(title=f"PPG beat minus preceding R peak, {label}", ylim=(0, 2.0),
+        ax.axhspan(0.2, 0.4, color=INK, alpha=0.08, linewidth=0)
+        ax.plot(at[m] / scale, delay[m], ".", markersize=1 if column == 0 else 3, color=BLUE,
+                label="PPG beat minus preceding R")
+        if column == 1:
+            inside = tracked & (ppg100 >= lo) & (ppg100 <= hi)
+            ax.plot(ppg100[inside] / scale, track["lag"][inside], ".", markersize=3, color=ORANGE,
+                    label="tracked lag (matched beats)")
+            ax.legend(frameon=False, loc="upper right", fontsize=8)
+        ax.set_xlim(lo / scale, hi / scale)
+        ax.set(title=f"PPG beat minus preceding R peak, {label}", ylim=(-1.0 if column else 0.0, 2.0),
                xlabel="hours" if column == 0 else "minutes", ylabel="delay (s); grey = one clock")
+    print(f"tracked lag: centre {lag_centre}, PPG beats matched {tracked.mean():.3f}, "
+          f"ECG rhythm jump fraction {px.ecg_rhythm(ecg_t)}")
 
     sleep = np.flatnonzero(z["stages"] > 0)
     picks = sleep[np.linspace(0, sleep.size - 1, 5).astype(int)[1:4]] if sleep.size >= 5 else np.arange(min(3, z["stages"].size))

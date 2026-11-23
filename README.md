@@ -13,7 +13,7 @@
 **PPG → IBI（`ppg_extraction.ppg_to_ibi`，真实和生成的 PPG 走同一个函数）：**
 
 1. 连续的 30 秒 epoch 拼成一整段再处理，不按 30 秒切开处理。
-2. 每段升到 100 Hz（50 Hz PPG 带宽有限，升采样不增加内容），`nk.ppg_clean(method="elgendi")` + `nk.ppg_peaks`，再用三点抛物线插值细化峰位（不需要 500 Hz 上采样）。
+2. 每段升到 100 Hz（50 Hz PPG 带宽有限，升采样不增加内容），`nk.ppg_clean(method="elgendi")` + `nk.ppg_peaks`，再用三点抛物线插值细化峰位（不需要 500 Hz 上采样）。存下的 50 Hz PPG 只做了抗混叠降采样，带通只在 `ppg_clean` 里做一次，和原始 100 Hz BVP 的处理完全相同。
 3. IBI = 相邻峰的时间差。超出 0.3–2.0 s 的间期为坏间期；连续坏间期不超过 2 个且不超过 3 s、两侧都有好间期时，在 25 Hz 网格上用两侧好间期线性插值补上；更长的坏段、段首段尾的坏段、心跳之外的点记 0。好间期和 WatchSleepNet 一样“保持”（每个 25 Hz 点取它所在心跳间期的值）。每个点的状态存在 `ibi_ppg_status`（0 实测、1 插值、2 坏段置 0、3 无心跳）。
 4. 切成 750 点的 30 秒 epoch；有效点（实测或插值）不到一半的 epoch，`epoch_ok = False`（分类时置 0，训练生成模型时可在 loss 里 mask）。
 
@@ -30,7 +30,9 @@
 | `ibi_wsn` | WatchSleepNet 原来逐 30 秒处理的方法 |
 | `ibi_ecg` | PSG ECG 的 R 峰（参照） |
 
-其他：按 PSG 的 30 秒判读边界切 epoch（只留阶段一致且为 W/N1/N2/N3/R 的 epoch，编码 0–4）；`ppg [n,1500]` 为整晚 0.5–8 Hz 零相位带通后降到 50 Hz 的 PPG，不做归一化；`events [n,1500,4]`；PPG 相对 ECG 的延迟和整夜漂移（判断 E4 与 PSG 是否对齐）；每个 epoch 的 SQI、手腕运动、平台段、缺失比例。
+其他：按 PSG 的 30 秒判读边界切 epoch（只留阶段一致且为 W/N1/N2/N3/R 的 epoch，编码 0–4）；`ppg [n,1500]` 为 E4 BVP 抗混叠降到 50 Hz（不另外滤波、不做归一化）；`events [n,1500,4]`；每个 epoch 的 SQI、手腕运动、平台段、缺失比例。
+
+**E4 与 PSG 的时钟：** 在 DREAMT（2.1.0 和 2.2.0 都一样）里，E4 的时间轴相对 PSG 会漂移并来回滑动，几分钟内可达 1–2 s（2.2.0 只改正了整体的固定偏移）。所以 PPG 心跳与 ECG 心跳的对应关系不是固定延迟，而是逐拍跟踪（`track_beats`/`align_beats`：alpha-beta 跟踪 + 每段按 RR 与 PP 最吻合的心跳对应）。另外：`ecg_rr_jump_fraction`（相邻 RR 变化 > 30% 的比例）> 0.2 记为 `ecg_irregular`（如二联律，腕部脉搏跟不上 ECG 心跳，ECG 不能当 PPG 心跳的参照）；`route_50_vs_100_*` 是 50 Hz 与 100 Hz 两条路在同一时钟上的心跳对比（直接回答 50 Hz 有没有损失，不受 E4 时钟影响）。`scripts/inspect_ppg_subject.py --subject SID ...` 画单人诊断图。
 
 在 Trillium 上（CPU 作业，排队比 GPU 快；**必须从 CPU 登录节点 `trillium.scinet.utoronto.ca` 提交**，每个作业是一整个 192 核节点，全部人并行处理）：
 
@@ -42,7 +44,7 @@ SUBJECTS="S002 S092" sbatch submit_extract_ppg.sh    # 先测两个人
 sbatch submit_extract_ppg.sh                         # 全部（重交会跳过已完成的人）
 ```
 
-先看 `report.csv`：`aligned`、`pulse_arrival_s`（正常约 0.2–0.5 s）；各 IBI 的 `*_mae_ms`、`*_coverage`、`*_big_error_fraction`（与 ECG 相差 > 100 ms 的比例）；`epoch_ok_fraction`。注意：做分类实验时，生成模型只能用分类训练集里的人训练，否则测试集的人会泄漏进生成数据。
+先看 `report.csv`：`route_50_vs_100_reference_matched` 和 `route_50_vs_100_ibi_median_abs_ms`（50 Hz 的损失）；`ecg_irregular`、`tracked_fraction`、`lag_median_s`；各 IBI 与 ECG 的 `*_mae_ms`、`*_big_error_fraction`（相差 > 100 ms 的比例，只在能跟踪到 ECG 的位置上算，`reference_coverage` 为其比例）；`epoch_ok_fraction`。注意：做分类实验时，生成模型只能用分类训练集里的人训练，否则测试集的人会泄漏进生成数据。
 
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）
 

@@ -31,12 +31,16 @@ import ppg_extraction as px
 
 SERIES = ("ppg50_clean", "ppg50_relative", "ppg50_raw", "ppg100_clean", "watchsleepnet")
 BEATS = ("ppg50", "ppg50_unrefined", "ppg100", "ppg100_unrefined", "watchsleepnet")
-CSV_FIELDS = (("subject", "status", "epochs", "sleep_period_epochs", "epoch_runs", "stage_changes_on_grid_fraction",
-               "aligned", "pulse_arrival_s", "pulse_arrival_concentration", "pulse_arrival_drift_s",
-               "coarse_hr_lag_s", "ecg_inverted", "ppg50_sensitivity", "ppg50_ppv")
+ALIGNMENT = ("ecg_inverted", "ecg_rr_jump_fraction", "ecg_irregular", "coarse_hr_lag_s", "tracked_fraction",
+             "lag_median_s", "lag_p5_s", "lag_p95_s")
+AGREEMENT = ("reference_matched", "other_matched", "dt_median_abs_ms", "dt_p95_abs_ms", "ibi_median_abs_ms",
+             "ibi_p95_abs_ms")
+CSV_FIELDS = (("subject", "status", "epochs", "sleep_period_epochs", "epoch_runs", "stage_changes_on_grid_fraction")
+              + ALIGNMENT + ("ppg50_sensitivity", "ppg50_ppv")
+              + tuple(f"route_50_vs_100_{key}" for key in AGREEMENT)
               + tuple(f"{name}_beat_ibi_mae_ms" for name in BEATS)
               + tuple(f"{name}_{key}" for name in SERIES for key in ("mae_ms", "coverage", "big_error_fraction"))
-              + ("epoch_ok_fraction", "epoch_ok_fraction_sleep_period", "epoch_ok_fraction_relative",
+              + ("reference_coverage", "epoch_ok_fraction", "epoch_ok_fraction_sleep_period", "epoch_ok_fraction_relative",
                  "measured_sample_fraction", "interpolated_sample_fraction", "artifact_sample_fraction",
                  "no_beat_sample_fraction", "median_sqi", "median_acc_std_g", "event_sample_fraction",
                  "participant_ahi", "seconds", "error"))
@@ -104,8 +108,10 @@ def flat_row(report):
     alignment = report.get("alignment") or {}
     beats, series = report.get("beat_accuracy") or {}, report.get("series_accuracy") or {}
     row = {key: report.get(key) for key in CSV_FIELDS}
-    row.update({key: alignment.get(key) for key in ("aligned", "pulse_arrival_s", "pulse_arrival_concentration",
-                                                    "pulse_arrival_drift_s", "coarse_hr_lag_s", "ecg_inverted")})
+    row.update({key: alignment.get(key) for key in ALIGNMENT})
+    agreement = report.get("route_agreement_50_vs_100") or {}
+    row.update({f"route_50_vs_100_{key}": agreement.get(key) for key in AGREEMENT})
+    row["reference_coverage"] = series.get("reference_coverage")
     row.update(ppg50_sensitivity=(beats.get("ppg50") or {}).get("sensitivity"),
                ppg50_ppv=(beats.get("ppg50") or {}).get("ppv"))
     for name in BEATS:
@@ -190,10 +196,11 @@ def run(cli):
         reports[sid] = report
         save_reports()                             # after every participant, so a stopped job loses nothing
         row = flat_row(report)
-        print(json.dumps({key: row.get(key) for key in ("subject", "status", "aligned", "pulse_arrival_s",
-                                                         "ppg50_clean_mae_ms", "ppg100_clean_mae_ms",
-                                                         "watchsleepnet_mae_ms", "epoch_ok_fraction",
-                                                         "seconds", "error")}), flush=True)
+        print(json.dumps({key: row.get(key) for key in ("subject", "status", "ecg_irregular", "tracked_fraction",
+                                                         "lag_median_s", "route_50_vs_100_reference_matched",
+                                                         "route_50_vs_100_ibi_median_abs_ms", "ppg50_clean_mae_ms",
+                                                         "ppg100_clean_mae_ms", "watchsleepnet_mae_ms",
+                                                         "epoch_ok_fraction", "seconds", "error")}), flush=True)
 
     if cli.workers > 1 and len(tasks) > 1:
         from concurrent.futures import ProcessPoolExecutor, as_completed
