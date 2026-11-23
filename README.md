@@ -56,8 +56,14 @@ sbatch submit_extract_ppg.sh                         # 全部（重交会跳过�
 
 ```bash
 python -B scripts/train_ppg.py --check-only             # 登录节点：检查数据、验证集和模型形状
-sbatch submit_train_ppg.sh                               # trig-login01 提交；12 小时，11.5 小时时自动暂停保存
-sbatch submit_train_ppg.sh /home/yxtao/links/scratch/dataset-generation-ppg50/runs/ppg50_<JOB>   # 续训
+# GPU debugjob 里快速测试：2 个短 epoch（每个 50 步，验证每人 4 个窗口），再续训 1 个
+python -B scripts/train_ppg.py --output-dir /home/yxtao/links/scratch/dataset-generation-ppg50/runs/smoke --epochs 2 --max-steps-per-epoch 50 --validation-windows 4
+python -B scripts/train_ppg.py --resume /home/yxtao/links/scratch/dataset-generation-ppg50/runs/smoke --epochs 3
+sbatch submit_train_ppg.sh                               # trig-login01 提交；4 小时，3.5 小时时自动暂停保存
+sbatch submit_train_ppg.sh /home/yxtao/links/scratch/dataset-generation-ppg50/runs/ppg50_<JOB>   # 续训（已完成的 epoch 都保留）
+# 一次排好几段续训：每段在上一段结束后自动开始
+J=$(sbatch --parsable submit_train_ppg.sh); R=/home/yxtao/links/scratch/dataset-generation-ppg50/runs/ppg50_$J
+for i in 1 2 3; do J=$(sbatch --parsable --dependency=afterany:$J submit_train_ppg.sh $R); done
 ```
 
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）

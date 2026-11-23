@@ -206,12 +206,24 @@ class TrainingTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             second = train_ppg.main(["--resume", str(out), "--epochs", "3", "--device", "cpu", "--allow-cpu",
                                      "--max-hours", "1e-9"])
-        self.assertEqual(second["status"], "paused")                            # stops after epoch 2
+        self.assertEqual(second["status"], "paused")                            # out of time inside epoch 2
+        self.assertEqual(second["epoch"], 1)
+        self.assertIn("longer than --max-hours", second["note"])
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             third = train_ppg.main(["--resume", str(out), "--device", "cpu", "--allow-cpu"])
         self.assertEqual(third["status"], "completed")
         rows = list(csv.DictReader((out / "metrics.csv").read_text().splitlines()))
         self.assertEqual([int(r["epoch"]) for r in rows], [1, 2, 3])
+        self.assertTrue(all(int(r["steps"]) == int(r["steps_per_full_epoch"]) for r in rows))
+        quick = self.folder / "quick"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            train_ppg.main(["--config", str(config_path), "--output-dir", str(quick), "--device", "cpu",
+                            "--allow-cpu", "--max-steps-per-epoch", "2", "--validation-windows", "1"])
+        quick_rows = list(csv.DictReader((quick / "metrics.csv").read_text().splitlines()))
+        self.assertEqual(int(quick_rows[0]["steps"]), 2)
+        self.assertGreater(float(quick_rows[0]["seconds_per_step"]), 0)
+        with np.load(quick / "validation" / "epoch_001.npz") as saved:
+            self.assertEqual(saved["generated"].shape, (2, 1500))              # 1 window x 2 participants
         self.assertTrue(all(np.isfinite(float(r["ibi_w1_ms"])) for r in rows))
         with np.load(out / "validation" / "epoch_003.npz") as saved:
             self.assertEqual(saved["generated"].shape, (4, 1500))

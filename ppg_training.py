@@ -52,7 +52,7 @@ DEFAULTS = dict(
                     seed=20261122, held_out=False, min_median_sqi=0.9, min_epoch_ok_fraction=0.95,
                     max_abs_lag_s=3.0),
     training=dict(epochs=50, batch_size=32, lr=1e-4, ema_decay=0.9999, s4_dropout=0.03, seed=42, num_workers=4,
-                  log_every=200),
+                  log_every=200, max_steps_per_epoch=None),
     model=dict(num_res_layers=4, res_channels=64, skip_channels=64, s4_dstate=64,
                diff_step_embed_in=32, diff_step_embed_mid=64, diff_step_embed_out=64),
     diffusion=dict(timesteps=200, beta_0=1e-4, beta_T=0.02, diffusion_schedule="linear_power",
@@ -518,8 +518,21 @@ class Trainer:
         for epoch in range(first_epoch, t["epochs"] + 1):
             epoch_start = time.time()
             model.train()
-            total, count = 0.0, 0
+            total, count, steps_done = 0.0, 0, 0
+            limit = t.get("max_steps_per_epoch")
             for step, batch in enumerate(loader, 1):
+                if limit is not None and step > limit:              # quick tests only
+                    break
+                if max_hours is not None and (time.time() - started) / 3600.0 > max_hours:
+                    # out of time inside an epoch: keep the last completed epoch's state.pt
+                    status = dict(status="paused", epoch=epoch - 1, best=best,
+                                  note="time ran out inside an epoch; that epoch restarts on resume")
+                    if not epoch_seconds:
+                        status["note"] = ("no epoch finished in this job: one epoch takes longer than --max-hours; "
+                                          "give the job more time")
+                    _save_json(self.output / "status.json", status)
+                    self.log(json.dumps(dict(event="paused_for_time", **status, resume_with=str(self.output))))
+                    return status
                 batch = batch.to(self.device, non_blocking=True)
                 loss = diffusion_loss(model, batch, schedule)
                 optimizer.zero_grad(set_to_none=True)
@@ -528,12 +541,18 @@ class Trainer:
                 ema.update(model)
                 total += float(loss.detach()) * batch.shape[0]
                 count += batch.shape[0]
+                steps_done = step
                 if step % t["log_every"] == 0:
                     self.log(json.dumps(dict(epoch=epoch, step=step, steps=len(loader), loss=total / count)))
+            train_seconds = time.time() - epoch_start
             evaluation = ema.evaluation_model(model).eval()
+            validation_start = time.time()
             generated = self.generate(evaluation, validation_arrays, schedule)
             summary, per_subject = validation_metrics(generated, validation_arrays[:, :, 0], owners, cfg)
             row = dict(epoch=epoch, train_loss=total / max(count, 1), **summary,
+                       steps=steps_done, steps_per_full_epoch=len(loader),
+                       seconds_per_step=round(train_seconds / max(steps_done, 1), 4),
+                       validation_seconds=round(time.time() - validation_start, 1),
                        seconds=round(time.time() - epoch_start, 1))
             is_best = summary["ibi_w1_ms"] < best["ibi_w1_ms"]
             if is_best:

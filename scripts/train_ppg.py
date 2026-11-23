@@ -6,6 +6,9 @@ Continue a paused or interrupted run (same configuration, state.pt in the run fo
   python scripts/train_ppg.py --resume /path/to/run --max-hours 23
 Check data, validation participants and model shapes without training (CPU is fine):
   python scripts/train_ppg.py --config configs/ppg50.json --check-only
+Quick GPU test in a debugjob (2 short epochs, then a resumed third one):
+  python scripts/train_ppg.py --output-dir RUNS/smoke --epochs 2 --max-steps-per-epoch 50 --validation-windows 4
+  python scripts/train_ppg.py --resume RUNS/smoke --epochs 3
 
 Run folder: config.json, run_summary.json (participants, windows, validation choice, scaler),
 metrics.csv (one row per epoch), best.pt (lowest validation IBI W1), last.pt, state.pt (resume),
@@ -34,6 +37,10 @@ def parse_args(argv=None):
     parser.add_argument("--resume", type=Path, default=None, help="run folder to continue (uses its config.json)")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--epochs", type=int, default=None, help="override training.epochs")
+    parser.add_argument("--max-steps-per-epoch", type=int, default=None,
+                        help="quick test: stop each epoch after this many updates")
+    parser.add_argument("--validation-windows", type=int, default=None,
+                        help="quick test: validation windows per participant")
     parser.add_argument("--max-hours", type=float, default=None, help="pause cleanly before this many hours")
     parser.add_argument("--device", default=None, help="cuda (default when available) or cpu")
     parser.add_argument("--allow-cpu", action="store_true", help="permit training without CUDA (tests only)")
@@ -52,7 +59,14 @@ def snapshot_source(destination):
 
 def main(argv=None):
     cli = parse_args(argv)
-    overrides = {"training": {"epochs": cli.epochs}} if cli.epochs else None
+    overrides = {}
+    if cli.epochs:
+        overrides.setdefault("training", {})["epochs"] = cli.epochs
+    if cli.max_steps_per_epoch:
+        overrides.setdefault("training", {})["max_steps_per_epoch"] = cli.max_steps_per_epoch
+    if cli.validation_windows:
+        overrides["validation"] = {"windows_per_subject": cli.validation_windows}
+    overrides = overrides or None
     if cli.resume is not None:
         output = cli.resume.expanduser().resolve()
         config = pt.load_config(output / "config.json", overrides)
