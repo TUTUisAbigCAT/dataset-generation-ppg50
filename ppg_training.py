@@ -492,7 +492,9 @@ class Trainer:
         schedule = build_diffusion(cfg, self.device)
         first_epoch, best = 1, dict(epoch=None, ibi_w1_ms=math.inf)
         if self.resume and state_path.is_file():
-            state = torch.load(state_path, map_location=self.device, weights_only=False)
+            # read on the CPU: RNG states must stay CPU ByteTensors; weights and optimizer state are
+            # copied to the model's device by load_state_dict
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
             if _without_epochs(state["config"]) != _without_epochs(cfg):
                 raise ValueError("Resume configuration differs from the saved run (only training.epochs may change)")
             model.load_state_dict(state["model"])
@@ -500,9 +502,9 @@ class Trainer:
                 ema.model.load_state_dict(state["ema"])
                 ema.updates = state["ema_updates"]
             optimizer.load_state_dict(state["optimizer"])
-            torch.set_rng_state(state["torch_rng"])
+            torch.set_rng_state(state["torch_rng"].cpu())
             if self.device.type == "cuda" and state.get("cuda_rng") is not None:
-                torch.cuda.set_rng_state(state["cuda_rng"])
+                torch.cuda.set_rng_state(state["cuda_rng"].cpu())
             first_epoch, best = state["epoch"] + 1, state["best"]
             self.log(json.dumps(dict(event="resumed", from_epoch=state["epoch"])))
         else:
@@ -573,11 +575,13 @@ class Trainer:
             torch.save(weights, self.output / "last.pt")
             if is_best:
                 torch.save(weights, self.output / "best.pt")
+            temporary = state_path.with_suffix(".pt.partial")              # never leave a half-written state
             torch.save(dict(model=model.state_dict(), ema=None if ema.model is None else ema.model.state_dict(),
                             ema_updates=ema.updates, optimizer=optimizer.state_dict(), epoch=epoch, best=best,
                             config=cfg, torch_rng=torch.get_rng_state(),
                             cuda_rng=torch.cuda.get_rng_state() if self.device.type == "cuda" else None),
-                       state_path)
+                       temporary)
+            temporary.replace(state_path)
             self.log(json.dumps(dict(event="epoch", **row)))
             epoch_seconds.append(time.time() - epoch_start)
             if max_hours is not None and epoch < t["epochs"]:
