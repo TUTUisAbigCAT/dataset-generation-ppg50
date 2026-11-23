@@ -5,8 +5,9 @@ Prints, for an extracted participant (scripts/extract_ppg.py output):
   * beats and IBI distribution of every detector (PPG 50->100 Hz, PPG 100 Hz, WatchSleepNet, ECG);
   * heart-rate cross-correlation lag of PPG against ECG for every hour (alignment or clock drift);
   * the stored alignment and accuracy report.
-Writes <out>/inspect_<SID>.png: IBI histograms, 5-min heart rate over the night, and three 20-s
-windows (cleaned PPG with its peaks, cleaned ECG with its R peaks).
+Writes <out>/inspect_<SID>.png: IBI histograms, 5-min heart rate over the night, hourly lag, the
+delay of every PPG beat after the preceding R peak (flat at 0.2-0.4 s if E4 and PSG share one
+clock), and three 20-s windows (cleaned PPG with its peaks, cleaned ECG with its R peaks).
 
   python scripts/inspect_ppg_subject.py --subject S002 \
       --raw-dir /home/yxtao/links/scratch/dreamt/data_100Hz \
@@ -120,8 +121,8 @@ def main(argv=None):
         print(f"series {name:18s}", json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in metrics.items()}))
 
     # ---- figure
-    fig = plt.figure(figsize=(14, 13), layout="constrained")
-    grid = fig.add_gridspec(5, 2, height_ratios=[1.1, 1.1, 1, 1, 1])
+    fig = plt.figure(figsize=(14, 16), layout="constrained")
+    grid = fig.add_gridspec(6, 2, height_ratios=[1.1, 1.1, 1.1, 1, 1, 1])
     ax = fig.add_subplot(grid[0, 0])
     bins = np.arange(0.2, 2.1, 0.02)
     for name, key, colour in (("ECG", "ecg_peaks_s", INK), ("PPG 50->100 Hz", "ppg_peaks_s", BLUE),
@@ -146,6 +147,24 @@ def main(argv=None):
     ax.axhline(0, color=INK, linewidth=0.8)
     ax.set(title="Hourly heart-rate cross-correlation lag (PPG minus ECG)", xlabel="hours", ylabel="lag (s)")
 
+    # every PPG beat minus the R peak before it: a flat band at 0.2-0.4 s means one shared clock
+    ppg100 = np.sort(z["ppg100_peaks_s"])
+    before = np.searchsorted(ecg_t, ppg100, side="right") - 1
+    ok = before >= 0
+    delay, at = ppg100[ok] - ecg_t[before[ok]], ppg100[ok]
+    near = delay < 2.0
+    sleep_epochs = np.flatnonzero(z["stages"] > 0)
+    centre = z["epoch_start_s"][sleep_epochs[sleep_epochs.size // 2]] if sleep_epochs.size else at.mean()
+    for column, (lo, hi, label) in enumerate(((at.min(), at.max(), "whole night"),
+                                              (centre - 300, centre + 300, "10 min in mid-sleep"))):
+        ax = fig.add_subplot(grid[2, column])
+        m = near & (at >= lo) & (at <= hi)
+        ax.axhspan(0.2, 0.4, color=INK, alpha=0.08, linewidth=0)
+        scale = 3600.0 if column == 0 else 60.0
+        ax.plot(at[m] / scale, delay[m], ".", markersize=1 if column == 0 else 3, color=BLUE)
+        ax.set(title=f"PPG beat minus preceding R peak, {label}", ylim=(0, 2.0),
+               xlabel="hours" if column == 0 else "minutes", ylabel="delay (s); grey = one clock")
+
     sleep = np.flatnonzero(z["stages"] > 0)
     picks = sleep[np.linspace(0, sleep.size - 1, 5).astype(int)[1:4]] if sleep.size >= 5 else np.arange(min(3, z["stages"].size))
     bvp, _ = px._fill_nan(frame["BVP"].to_numpy(dtype=np.float64))
@@ -161,7 +180,7 @@ def main(argv=None):
         start = z["epoch_start_s"][epoch] + 5.0
         t = np.arange(int(start * 100), int((start + 20) * 100)) / 100
         rows = (t * 100).astype(int)
-        ax = fig.add_subplot(grid[2 + row, :])
+        ax = fig.add_subplot(grid[3 + row, :])
         y = ppg_clean[rows]
         ax.plot(t, (y - y.mean()) / (y.std() or 1) + 3, color=BLUE, linewidth=1.2)
         for beats, colour, level in ((ppg_t, BLUE, 5.6), (z["wsn_peaks_s"], ORANGE, 6.4)):
