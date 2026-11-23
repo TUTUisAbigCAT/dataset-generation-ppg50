@@ -6,6 +6,29 @@
 
 网络结构、优化器、epsilon MSE 损失和训练更新公式沿用固定上游版本；本地 S4 慢速 Cauchy 回退计算补齐遗漏的共轭项。新训练通过独立的 `diffusion_schedule.py` 将200步日程的终点累计 alpha 调整到约 `1e-8`，使训练末态更接近采样使用的标准高斯起点；训练与推理使用同一记录日程。采样运行时另修正一处后验噪声系数：使用后验方差的平方根作为标准差；固定上游源码及 `training_utils.py` 不改写。在 `de30ac2` 的数据与 CUDA 设备适配基础上，增加每轮生成验证、loss 数值平均及早停；本地改动纳入源码检查器的逐项白名单。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## 50 Hz PPG 生成：DREAMT 2.2.0 PPG 提取（dataset-generation-ppg50）
+
+本仓库从 dataset-generation-30s-apnea（`4d31531`）分出，用来做“直接生成 PPG → 转 IBI → 睡眠分期”；30 秒 IBI + 呼吸事件的实验仍在原仓库，本仓库不改动它。下面第一步是提取训练用的真实 PPG。
+
+目标：让生成模型直接生成 50 Hz PPG（每 30 秒 1500 点），再把 PPG 转成和 WatchSleepNet 相同格式的 IBI（25 Hz、逐点保持上一个心跳间期、0.3–2.0 s 以外记 0）去做睡眠分期。这一步先从 DREAMT 2.2.0 原始 CSV 提取训练用的真实 PPG，并用 PSG 的 ECG 检查它有多准。文件：`ppg_extraction.py`、`scripts/extract_ppg.py`、`submit_extract_ppg.sh`。**原始 CSV 只读**，结果写到新文件夹（默认 `/home/yxtao/links/scratch/WatchSleepProcessedDataset/DREAMT22_PPG50`）。
+
+1. **按 PSG 的 30 秒网格切 epoch**：从睡眠阶段变化点推出网格偏移（`report.csv` 的 `stage_changes_on_grid_fraction` 应为 1），只保留整段阶段一致且标为 W/N1/N2/N3/R 的 epoch，阶段编码 0–4（N1、N2 分开存，训练时再合并为 Light）。和 WatchSleepNet 的滑动查找不同，epoch 边界就是 PSG 判读的边界。
+2. **PPG**：E4 BVP 整晚零相位 0.5–8 Hz 带通，抗混叠 2:1 降到 50 Hz；不做归一化（训练时按窗口做）。
+3. **心跳与 IBI**：neurokit2 Elgendi 检测峰，再在 500 Hz 三次样条上细化峰位（补回 50 Hz 的时间分辨率）。真实 PPG 和以后生成的 PPG 都走同一个函数 `ppg_extraction.ppg_to_ibi`；连续的 epoch 先拼起来再检测，所以 epoch 边界不会出现人为的 0。
+4. **用 ECG 做参照**：PSG ECG 的 R 峰（同样细化）给出 PPG 相对 ECG 的延迟（脉搏到达时间，正常约 0.2–0.5 s）和整夜每 30 分钟的漂移，用来判断 E4 与 PSG 是否对齐（`aligned`）；逐拍匹配给出灵敏度、PPV 和 IBI 误差（ms），同时比较 50 Hz、100 Hz、不细化，以及 WatchSleepNet 原来逐 epoch 的方法。
+5. **质量只标记不修改**：每个 epoch 存模板相关 SQI、手腕运动（ACC 幅值标准差，g）、平台段比例、缺失比例、ECG 心跳被 PPG 检出的比例；Kubios 方法标出异常心跳。`good_epoch` 只是按阈值算出的标记，阈值可在命令行改。
+
+每人一个 `<SID>.npz`：`ppg [n,1500]`、`stages`、`epoch_index`、`epoch_start_s`、`events [n,1500,4]`、`ibi_ppg / ibi_ecg / ibi_wsn [n,750]`、各路心跳时刻、各项质量和 `good_epoch`；另有 `report.json`、`report.csv`。
+
+```bash
+# 仓库放在 /project/def-plago/yxtao/dataset-generation-ppg50，环境沿用 v2：ln -s ../dataset-generation-v2/.venv .venv
+source .venv/bin/activate && (pip install --no-index neurokit2 || pip install neurokit2)   # 登录节点，只需一次
+SUBJECTS="S002 S092" sbatch submit_extract_ppg.sh    # 先测两个人
+sbatch submit_extract_ppg.sh                         # 全部（重交会跳过已完成的人）
+```
+
+先看 `report.csv` 的 `aligned`、`pulse_arrival_s`、`ppg50_ibi_mae_ms`（对比 `watchsleepnet_ibi_mae_ms`）和 `good_epoch_fraction`。注意：做分类实验时，生成模型只能用分类训练集里的人训练，否则测试集的人会泄漏进生成数据。
+
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）
 
 本仓库从 dataset-generation-v2（`3aaea1b`）分出，只做三件事，**原始数据和已有 NPZ 不改**，归一化与缺失值策略沿用推荐配置（`preserve`，0–2 s 线性映射到 [−1, 1]）：
