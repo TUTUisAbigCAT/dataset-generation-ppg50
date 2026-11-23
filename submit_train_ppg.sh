@@ -1,0 +1,32 @@
+#!/bin/bash
+#SBATCH --account=def-plago
+#SBATCH --gpus-per-node=1
+#SBATCH --time=12:00:00
+#SBATCH --job-name=train-ppg50
+#SBATCH --output=/home/yxtao/links/scratch/dataset-generation/logs/train_ppg50_%j.txt
+# Train the 50 Hz PPG diffusion model (GPU; submit from trig-login01).
+# Run from /project/def-plago/yxtao/dataset-generation-ppg50:
+#   sbatch submit_train_ppg.sh                 # new run: <output_root>/ppg50_<job id>
+#   sbatch submit_train_ppg.sh RUN_DIR         # continue a paused or interrupted run
+# The job pauses cleanly before MAX_HOURS (default 11.5 h of the 12 h limit); resubmit with the run
+# folder to continue. Progress: the log (one line per epoch) and RUN_DIR/metrics.csv.
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR}"
+module load StdEnv/2023 gcc/12.3
+module load python/3.11
+module load scipy-stack/2024a
+source ./.venv/bin/activate
+# $HOME and $PROJECT are read-only inside Trillium jobs: keep caches on the job's local disk.
+export XDG_CACHE_HOME="${SLURM_TMPDIR:-/tmp}/cache" MPLCONFIGDIR="${SLURM_TMPDIR:-/tmp}/matplotlib"
+mkdir -p "$XDG_CACHE_HOME" "$MPLCONFIGDIR"
+
+RUN="${1:-${RUN:-}}"
+CONFIG="${CONFIG:-configs/ppg50.json}"
+MAX_HOURS="${MAX_HOURS:-11.5}"
+python -c "import torch, neurokit2, numpy; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'neurokit2', neurokit2.__version__, 'numpy', numpy.__version__)"
+if [ -n "$RUN" ]; then
+  python -B -u scripts/train_ppg.py --resume "$RUN" --max-hours "$MAX_HOURS"
+else
+  python -B -u scripts/train_ppg.py --config "$CONFIG" --max-hours "$MAX_HOURS"
+fi

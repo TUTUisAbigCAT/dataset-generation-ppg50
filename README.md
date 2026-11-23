@@ -47,6 +47,19 @@ sbatch submit_extract_ppg.sh                         # 全部（重交会跳过�
 
 先看 `report.csv`：`route_50_vs_100_reference_matched` 和 `route_50_vs_100_ibi_median_abs_ms`（50 Hz 的损失）；`ecg_irregular`、`tracked_fraction`、`lag_median_s`；各 IBI 与 ECG 的 `*_mae_ms`、`*_big_error_fraction`（相差 > 100 ms 的比例，只在能跟踪到 ECG 的位置上算，`reference_coverage` 为其比例）；`epoch_ok_fraction`。注意：做分类实验时，生成模型只能用分类训练集里的人训练，否则测试集的人会泄漏进生成数据。
 
+**训练 50 Hz PPG 生成模型（`ppg_training.py`、`scripts/train_ppg.py`、`submit_train_ppg.sh`、`configs/ppg50.json`）：**
+
+- 模型和扩散与 IBI 实验相同：SSSD-S4（4 层 × 64 通道，S4 长度 = 1500），200 步 `linear_power`（末端 alpha_bar 1e-8），只对 PPG 通道做 epsilon-MSE，EMA 0.9999，采样用后验标准差修正后的 DDPM 反向步。S4 里以零步长共享内存注册的 B/P/w 在建模型后复制成独立存储（数值不变；否则优化器原地更新会互相覆盖，检查点也无法读回）。
+- 数据：每个窗口 1 个 30 秒 epoch（1500 点），默认只用 `epoch_ok` 的 epoch；11 个通道 = PPG、阶段 one-hot（W / Light = N1+N2 / REM / Deep）、AHI/BMI/AGE z 分数、性别 F/M、呼吸事件 0/1（逐点）。PPG 按窗口归一化：减中位数，除以 1–99% 分位范围的一半，截断到 ±3。
+- **选模不用 S092：** 验证集默认从提取报告里自动选 8 人（ECG 心律正常、PPG 质量好、E4 时钟与 PSG 相差 ≤ 3 s，S092 永远不选），按 AHI 均匀分布，每人 32 个窗口，仍参与训练（`held_out: false`，与之前的协议一致）。每个 epoch 用 EMA 模型生成这些窗口，生成和真实 PPG 都经 `ppg_to_ibi` 转成 IBI，按每人 IBI 分布的 Wasserstein-1 距离（ms）的平均选 `best.pt`；`metrics.csv` 还记录 IBI 均值偏差、有效比例、每窗心跳数、频谱差。
+- 输出：`<output_root>/ppg50_<job id>/` 下的 `config.json`、`run_summary.json`（参与者、窗口数、验证集及选择理由、归一化参数）、`metrics.csv`、`best.pt`、`last.pt`、`state.pt`（续训）、`validation/epoch_XXX.npz`、`source/`。
+
+```bash
+python -B scripts/train_ppg.py --check-only             # 登录节点：检查数据、验证集和模型形状
+sbatch submit_train_ppg.sh                               # trig-login01 提交；12 小时，11.5 小时时自动暂停保存
+sbatch submit_train_ppg.sh /home/yxtao/links/scratch/dataset-generation-ppg50/runs/ppg50_<JOB>   # 续训
+```
+
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）
 
 本仓库从 dataset-generation-v2（`3aaea1b`）分出，只做三件事，**原始数据和已有 NPZ 不改**，归一化与缺失值策略沿用推荐配置（`preserve`，0–2 s 线性映射到 [−1, 1]）：
