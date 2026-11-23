@@ -153,7 +153,8 @@ class PpgCohort:
                     continue
                 record = dict(ppg=z["ppg"].astype(np.float32), stages=z["stages"].astype(np.int64),
                               epoch_index=z["epoch_index"].astype(np.int64), epoch_ok=z["epoch_ok"].astype(bool),
-                              apnea=z["events"].max(axis=2).astype(np.uint8), schema=schema)
+                              apnea=z["events"].max(axis=2).astype(np.uint8), schema=schema,
+                              epoch_start_s=z["epoch_start_s"].astype(np.float64) if "epoch_start_s" in z.files else None)
             row = participants.loc[sid]
             gender = str(row["GENDER"]).strip().upper()
             continuous = np.array([float(row[c]) for c in CONTINUOUS])
@@ -579,6 +580,9 @@ class Trainer:
             torch.save(weights, self.output / "last.pt")
             if is_best:
                 torch.save(weights, self.output / "best.pt")
+            if epoch % 10 == 0:                                   # kept, so epochs can be compared later
+                (self.output / "checkpoints").mkdir(exist_ok=True)
+                torch.save(weights, self.output / "checkpoints" / f"epoch_{epoch:03d}.pt")
             temporary = state_path.with_suffix(".pt.partial")              # never leave a half-written state
             torch.save(dict(model=model.state_dict(), ema=None if ema.model is None else ema.model.state_dict(),
                             ema_updates=ema.updates, optimizer=optimizer.state_dict(), epoch=epoch, best=best,

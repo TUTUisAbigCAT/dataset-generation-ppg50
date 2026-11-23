@@ -12,6 +12,7 @@ Quick GPU test in a debugjob (2 short epochs, then a resumed third one):
 
 Run folder: config.json, run_summary.json (participants, windows, validation choice, scaler),
 metrics.csv (one row per epoch), best.pt (lowest validation IBI W1), last.pt, state.pt (resume),
+checkpoints/epoch_XXX.pt (every 10 epochs),
 validation/epoch_XXX.npz (generated and real validation windows), source/ (code snapshot).
 """
 from __future__ import annotations
