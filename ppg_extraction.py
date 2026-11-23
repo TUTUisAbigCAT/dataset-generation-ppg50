@@ -38,7 +38,7 @@ import warnings
 
 import numpy as np
 
-SCHEMA = "dreamt_ppg50_extraction_v2"
+SCHEMA = "dreamt_ppg50_extraction_v3"
 FS_RAW = 100
 FS_PPG = 50
 FS_DETECT = 100

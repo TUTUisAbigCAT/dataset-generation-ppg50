@@ -4,7 +4,8 @@ See ppg_extraction.py for what is computed. Outputs (in --output-dir):
   <SID>.npz     per-epoch PPG (50 Hz), stages, events, beats, 25 Hz IBI variants, epoch_ok, quality
   report.json   every participant's full report (alignment, accuracy vs ECG, quality)
   report.csv    one row per participant with the key numbers
-Participants already written are kept, so the job can be resubmitted.
+Participants already written by this version are kept, so the job can be resubmitted; files written by
+an older extraction version (another schema) are redone.
 
 Example:
   python scripts/extract_ppg.py --raw-dir /home/yxtao/links/scratch/dreamt/data_100Hz \
@@ -162,13 +163,16 @@ def run(cli):
     for sid in subjects:
         target = output / f"{sid}.npz"
         if target.exists():
-            kept = reports.get(sid) if reports.get(sid, {}).get("status") in ("written", "kept_existing") else None
-            if kept is None:                       # written by a job that stopped before saving report.json
-                try:
-                    with np.load(target) as saved:
-                        kept = json.loads(str(saved["report"]))
-                except Exception:
-                    kept = None
+            try:                                   # outputs of an older extraction version are redone
+                with np.load(target) as saved:
+                    current = str(saved["schema"]) == px.SCHEMA
+                    stored = json.loads(str(saved["report"])) if current else None
+            except Exception:
+                current, stored = False, None
+            kept = None
+            if current:
+                kept = reports.get(sid) if reports.get(sid, {}).get("status") in ("written", "kept_existing") else None
+                kept = kept or stored              # written by a job that stopped before saving report.json
             if kept is not None:
                 reports[sid] = dict(kept, status="kept_existing")
                 continue

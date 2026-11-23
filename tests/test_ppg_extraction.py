@@ -350,6 +350,15 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual((out / "S001.npz").stat().st_mtime_ns, stamp)
         self.assertEqual(third["subjects"]["S001"]["status"], "kept_existing")
         self.assertAlmostEqual(third["subjects"]["S001"]["alignment"]["lag_median_s"], PAT, delta=0.03)
+        with np.load(out / "S001.npz") as saved:                  # an older version's file is redone
+            arrays = {key: saved[key] for key in saved.files}
+        arrays["schema"] = np.array("dreamt_ppg50_extraction_v2")
+        np.savez_compressed(out / "S001.npz", **arrays)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            fourth = extract_ppg.run(extract_ppg.parse_args(args))
+        self.assertEqual(fourth["subjects"]["S001"]["status"], "written")
+        with np.load(out / "S001.npz") as saved:
+            self.assertEqual(str(saved["schema"]), px.SCHEMA)
 
 
 if __name__ == "__main__":
