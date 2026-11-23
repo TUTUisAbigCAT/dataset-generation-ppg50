@@ -410,6 +410,10 @@ def validation_metrics(generated, real, owners, config, *, missing_penalty_ms=20
     diffs = [m["ibi_mean_gen_ms"] - m["ibi_mean_real_ms"] for m in per_subject.values()
              if m["ibi_mean_gen_ms"] is not None and m["ibi_mean_real_ms"] is not None]
     summary["ibi_mean_bias_ms"] = float(np.mean(diffs)) if diffs else None
+    # amplitude in normalized units: an untrained reverse process can grow far beyond the data scale
+    summary["std_gen"] = float(np.std(generated))
+    summary["std_real"] = float(np.std(real))
+    summary["max_abs_gen"] = float(np.max(np.abs(generated)))
     return summary, per_subject
 
 

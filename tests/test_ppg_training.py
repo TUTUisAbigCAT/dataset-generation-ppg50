@@ -182,6 +182,7 @@ class TrainingTests(unittest.TestCase):
         real = np.stack([cohort.window_array(*w)[:, 0] for w in windows])
         summary, per_subject = pt.validation_metrics(real, real, [s for s, _ in windows], config)
         self.assertEqual(summary["ibi_w1_ms"], 0.0)
+        self.assertEqual(summary["std_gen"], summary["std_real"])
         self.assertGreater(per_subject["S001"]["beats_per_window_real"], 30)
         noise = np.random.default_rng(1).normal(size=real.shape).astype(np.float32)
         worse, _ = pt.validation_metrics(noise, real, [s for s, _ in windows], config)
