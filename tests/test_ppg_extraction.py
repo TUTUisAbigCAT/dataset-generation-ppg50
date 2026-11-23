@@ -228,6 +228,26 @@ class PpgToIbiTests(unittest.TestCase):
         self.assertTrue((gapped["status"][1, -5:] == px.NO_BEAT).all())  # after the last beat before the gap
         self.assertTrue((gapped["ibi"][2, :5] == 0).all())
 
+    def test_local_amplitude_keeps_beats_next_to_a_loud_artifact(self):
+        rng = np.random.default_rng(3)
+        fs, t = 100, np.arange(0, 600, 0.01)
+        beats = np.cumsum(0.9 + rng.normal(0, 0.02, 700))
+        beats = beats[beats < 599]
+        signal = sum(np.exp(-0.5 * ((t - b) / 0.07) ** 2) + 0.3 * np.exp(-0.5 * ((t - b - 0.3) / 0.08) ** 2)
+                     for b in beats) + 0.05 * rng.normal(size=t.size)
+        loud = (t > 200) & (t < 300)
+        signal[loud] += 40 * np.sin(2 * np.pi * 1.3 * t[loud]) * rng.uniform(0.5, 1.5, loud.sum())
+        quiet = (beats < 190) | (beats > 310)
+        found = {}
+        for method in px.PEAK_METHODS:
+            peaks = px.ppg_peaks(signal, fs, method=method)[1] / fs
+            found[method] = (px.match_beats(beats[quiet], peaks, 0.0, tolerance=0.05) >= 0).mean()
+        self.assertLess(found["elgendi"], 0.5)                 # one global threshold: quiet beats lost
+        self.assertGreater(found["elgendi_local"], 0.98)
+        self.assertGreater(found["charlton"], 0.98)
+        with self.assertRaises(ValueError):
+            px.ppg_peaks(signal, fs, method="other")
+
     def test_shapes_are_checked_and_flat_input_gives_zeros(self):
         with self.assertRaises(ValueError):
             px.ppg_to_ibi(np.zeros((2, 1000)), 50, np.array([0.0, 30.0]))
@@ -288,6 +308,10 @@ class ExtractionTests(unittest.TestCase):
         self.assertLess(beats["ppg50"]["mae_ms"], beats["ppg50_unrefined"]["mae_ms"])
         self.assertLess(beats["ppg100"]["mae_ms"], 3.0)
         self.assertIn("watchsleepnet", beats)
+        for name in ("ppg50_elgendi", "ppg50_charlton"):
+            self.assertGreater(beats[name]["sensitivity"], 0.95, name)
+            self.assertIn(f"{name}_clean", r["series_accuracy"])
+        self.assertEqual(r["peak_method"], "elgendi_local")
 
     def test_flat_segment_is_zeroed_and_missed_beat_only_fixed_by_the_relative_rule(self):
         a, series = self.arrays, self.report["series_accuracy"]
@@ -352,7 +376,7 @@ class ExtractionTests(unittest.TestCase):
         self.assertAlmostEqual(third["subjects"]["S001"]["alignment"]["lag_median_s"], PAT, delta=0.03)
         with np.load(out / "S001.npz") as saved:                  # an older version's file is redone
             arrays = {key: saved[key] for key in saved.files}
-        arrays["schema"] = np.array("dreamt_ppg50_extraction_v2")
+        arrays["schema"] = np.array("dreamt_ppg50_extraction_v3")
         np.savez_compressed(out / "S001.npz", **arrays)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             fourth = extract_ppg.run(extract_ppg.parse_args(args))

@@ -13,7 +13,7 @@
 **PPG → IBI（`ppg_extraction.ppg_to_ibi`，真实和生成的 PPG 走同一个函数）：**
 
 1. 连续的 30 秒 epoch 拼成一整段再处理，不按 30 秒切开处理。
-2. 每段升到 100 Hz（50 Hz PPG 带宽有限，升采样不增加内容），`nk.ppg_clean(method="elgendi")` + `nk.ppg_peaks`，再用三点抛物线插值细化峰位（不需要 500 Hz 上采样）。存下的 50 Hz PPG 只做了抗混叠降采样，带通只在 `ppg_clean` 里做一次，和原始 100 Hz BVP 的处理完全相同。
+2. 每段升到 100 Hz（50 Hz PPG 带宽有限，升采样不增加内容），`nk.ppg_clean(method="elgendi")` + `nk.ppg_peaks`（Elgendi，在除以 5 秒滑动 RMS 的信号上找峰：Elgendi 的阈值用整段输入的均值，整段处理时大幅伪迹会抬高全段阈值、安静段漏检；S002 漏检间期从 5.7% 降到 0.5%），再用三点抛物线插值细化峰位（不需要 500 Hz 上采样）。存下的 50 Hz PPG 只做了抗混叠降采样，带通只在 `ppg_clean` 里做一次，和原始 100 Hz BVP 的处理完全相同。
 3. IBI = 相邻峰的时间差。超出 0.3–2.0 s 的间期为坏间期；连续坏间期不超过 2 个且不超过 3 s、两侧都有好间期时，在 25 Hz 网格上用两侧好间期线性插值补上；更长的坏段、段首段尾的坏段、心跳之外的点记 0。好间期和 WatchSleepNet 一样“保持”（每个 25 Hz 点取它所在心跳间期的值）。每个点的状态存在 `ibi_ppg_status`（0 实测、1 插值、2 坏段置 0、3 无心跳）。
 4. 切成 750 点的 30 秒 epoch；有效点（实测或插值）不到一半的 epoch，`epoch_ok = False`（分类时置 0，训练生成模型时可在 loss 里 mask）。
 
@@ -27,6 +27,7 @@
 | `ibi_ppg_relative` | 同上，另把偏离局部中位数（11 个间期）超过 30% 的间期也算坏间期（能抓到 0.3–2.0 s 范围内的漏检和多检） |
 | `ibi_ppg_raw` | 同上，但不插值（所有坏间期置 0，即 WatchSleepNet 的规则） |
 | `ibi_ppg100` | 原始 100 Hz BVP 直接走 1–4 步（老师的原始做法，用来确认 50 Hz 没有损失） |
+| （只在 report 里） | 换检测器的对照：`ppg50_elgendi`（整段直接 Elgendi，不做幅度归一化）、`ppg50_charlton`（Charlton 的 MSPTDfast）；`--peak-method` 可换主结果的检测器 |
 | `ibi_wsn` | WatchSleepNet 原来逐 30 秒处理的方法 |
 | `ibi_ecg` | PSG ECG 的 R 峰（参照） |
 

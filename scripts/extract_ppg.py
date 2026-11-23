@@ -30,8 +30,10 @@ import numpy as np
 
 import ppg_extraction as px
 
-SERIES = ("ppg50_clean", "ppg50_relative", "ppg50_raw", "ppg100_clean", "watchsleepnet")
-BEATS = ("ppg50", "ppg50_unrefined", "ppg100", "ppg100_unrefined", "watchsleepnet")
+SERIES = ("ppg50_clean", "ppg50_relative", "ppg50_raw", "ppg100_clean", "ppg50_elgendi_clean",
+          "ppg50_charlton_clean", "ppg50_elgendi_local_clean", "watchsleepnet")
+BEATS = ("ppg50", "ppg50_unrefined", "ppg100", "ppg100_unrefined", "ppg50_elgendi", "ppg50_charlton",
+         "ppg50_elgendi_local", "watchsleepnet")
 ALIGNMENT = ("ecg_inverted", "ecg_rr_jump_fraction", "ecg_irregular", "coarse_hr_lag_s", "tracked_fraction",
              "lag_median_s", "lag_p5_s", "lag_p95_s")
 AGREEMENT = ("reference_matched", "other_matched", "dt_median_abs_ms", "dt_p95_abs_ms", "ibi_median_abs_ms",
@@ -69,6 +71,8 @@ def parse_args(argv=None):
                         help="extra rule of the ibi_ppg_relative variant: bad if |ibi - local median| > this x median")
     parser.add_argument("--relative-window", type=int, default=c["relative_window"],
                         help="intervals in the local median")
+    parser.add_argument("--peak-method", choices=px.PEAK_METHODS, default="elgendi_local",
+                        help="beat detector of the main IBI (the other two are stored as comparisons)")
     cli = parser.parse_args(argv)
     if cli.workers < 1:
         parser.error("--workers must be positive")
@@ -130,6 +134,7 @@ def process_subject(task):
         arrays, report = px.extract_subject(csv_path, ecg_column=options["ecg_column"],
                                             watchsleepnet=options["watchsleepnet"], cleaning=options["cleaning"],
                                             relative_threshold=options["relative_threshold"],
+                                            peak_method=options["peak_method"],
                                             ahi=options["ahi"].get(sid))
         temporary = Path(target).with_name("." + Path(target).stem + ".partial.npz")
         np.savez_compressed(temporary, **arrays)
@@ -158,7 +163,8 @@ def run(cli):
     previous = output / "report.json"
     reports = json.loads(previous.read_text(encoding="utf-8")).get("subjects", {}) if previous.is_file() else {}
     options = dict(ecg_column=cli.ecg_column, watchsleepnet=not cli.no_watchsleepnet, ahi=participant_ahi(cli.metadata),
-                   cleaning=cleaning_from(cli), relative_threshold=cli.relative_threshold)
+                   cleaning=cleaning_from(cli), relative_threshold=cli.relative_threshold,
+                   peak_method=cli.peak_method)
     tasks = []
     for sid in subjects:
         target = output / f"{sid}.npz"

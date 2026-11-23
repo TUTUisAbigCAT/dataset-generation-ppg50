@@ -3,8 +3,10 @@
 PPG -> IBI (ppg_to_ibi; identical for real and generated PPG):
   1. Contiguous blocks: consecutive 30-s epochs are joined; nothing is processed per 30-s chunk.
   2. Each block is resampled to 100 Hz (50 Hz PPG is band-limited, so this adds no content),
-     cleaned with nk.ppg_clean(method="elgendi"), peaks from nk.ppg_peaks, and every peak is
-     refined by 3-point parabolic interpolation (sub-sample timing, no 500 Hz upsampling).
+     cleaned with nk.ppg_clean(method="elgendi"), peaks from nk.ppg_peaks (Elgendi) on the cleaned
+     block divided by its 5-s running RMS (Elgendi's threshold is global otherwise, and a long block
+     then loses beats next to loud artifacts), and every peak is refined by 3-point parabolic
+     interpolation (sub-sample timing, no 500 Hz upsampling).
   3. IBI = diff(peak times). Intervals outside 0.3-2.0 s (optionally also those far from the local
      median) are bad. A short run of bad intervals (<= 2 intervals and <= 3 s, with good intervals
      on both sides) is filled on the 25 Hz grid by linear interpolation between the neighbouring
@@ -38,7 +40,7 @@ import warnings
 
 import numpy as np
 
-SCHEMA = "dreamt_ppg50_extraction_v3"
+SCHEMA = "dreamt_ppg50_extraction_v4"
 FS_RAW = 100
 FS_PPG = 50
 FS_DETECT = 100
@@ -148,19 +150,47 @@ def refine_peaks_parabolic(signal, peaks, sampling_rate):
     return exact, exact / float(sampling_rate)
 
 
-def ppg_peaks(signal, fs):
-    """(cleaned, integer peaks): nk.ppg_clean(method="elgendi") and nk.ppg_peaks at fs."""
+PEAK_METHODS = ("elgendi_local", "elgendi", "charlton")
+
+
+def local_rms(signal, fs, window_s):
+    from scipy.ndimage import uniform_filter1d
+
+    power = uniform_filter1d(np.asarray(signal, dtype=np.float64) ** 2, size=max(int(window_s * fs), 1), mode="nearest")
+    rms = np.sqrt(np.maximum(power, 0.0))
+    floor = 1e-6 * (float(np.median(rms)) or 1.0)
+    return np.maximum(rms, floor)
+
+
+def ppg_peaks(signal, fs, *, method="elgendi_local", rms_window_s=5.0):
+    """(cleaned, integer peaks) on one contiguous block.
+
+    The block is cleaned with nk.ppg_clean(method="elgendi"). Peaks:
+      elgendi_local  nk.ppg_peaks (Elgendi) on the cleaned block divided by its 5-s running RMS. Elgendi's
+                     threshold uses the mean of the squared signal over the whole input, so on a long block
+                     loud artifact periods raise it everywhere and quiet stretches lose beats; the local
+                     normalization keeps the block processing (no edge effects) with local thresholds.
+      elgendi        nk.ppg_peaks on the cleaned block as is.
+      charlton       nk.ppg_findpeaks(method="charlton"), MSPTDfast (Charlton et al.).
+    Peak refinement and SQI always use the cleaned block itself.
+    """
     import neurokit2 as nk
 
+    if method not in PEAK_METHODS:
+        raise ValueError(f"peak method must be one of {PEAK_METHODS}")
     signal, _ = _fill_nan(signal)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         cleaned = np.asarray(nk.ppg_clean(signal, sampling_rate=fs, method="elgendi"), dtype=np.float64)
         try:
-            if hasattr(nk, "ppg_peaks"):
-                peaks = nk.ppg_peaks(cleaned, sampling_rate=fs, method="elgendi")[1]["PPG_Peaks"]
-            else:                                        # neurokit2 < 0.2.4
-                peaks = nk.ppg_findpeaks(cleaned, sampling_rate=fs, method="elgendi")["PPG_Peaks"]
+            if method == "charlton":
+                peaks = nk.ppg_findpeaks(cleaned, sampling_rate=fs, method="charlton")["PPG_Peaks"]
+            else:
+                x = cleaned / local_rms(cleaned, fs, rms_window_s) if method == "elgendi_local" else cleaned
+                if hasattr(nk, "ppg_peaks"):
+                    peaks = nk.ppg_peaks(x, sampling_rate=fs, method="elgendi")[1]["PPG_Peaks"]
+                else:                                    # neurokit2 < 0.2.4
+                    peaks = nk.ppg_findpeaks(x, sampling_rate=fs, method="elgendi")["PPG_Peaks"]
             peaks = np.asarray(peaks, dtype=np.int64)
         except Exception:                                # flat or too short signal
             peaks = np.zeros(0, dtype=np.int64)
@@ -206,7 +236,8 @@ def ecg_beats(ecg, fs):
 
 
 # --------------------------------------------------------------------------- PPG -> IBI
-def ppg_blocks(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, epoch_seconds=EPOCH_SECONDS):
+def ppg_blocks(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, epoch_seconds=EPOCH_SECONDS,
+               peak_method="elgendi_local"):
     """Step 2 on every contiguous block: list of dicts (epochs, beat times, unrefined times, cleaned SQI)."""
     epochs = np.asarray(epochs, dtype=np.float64)
     samples = int(round(fs * epoch_seconds))
@@ -219,7 +250,7 @@ def ppg_blocks(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, epoch_seconds=
     blocks = []
     for run in epoch_runs(starts, epoch_seconds):
         signal = resample_to(epochs[run].reshape(-1), fs, detect_fs)
-        cleaned, peaks = ppg_peaks(signal, detect_fs)
+        cleaned, peaks = ppg_peaks(signal, detect_fs, method=peak_method)
         _, times = refine_peaks_parabolic(cleaned, peaks, detect_fs)
         bounds = [(k * per_epoch, (k + 1) * per_epoch) for k in range(run.size)]
         blocks.append(dict(epochs=run, beat_times_s=times + starts[run[0]],
@@ -297,13 +328,13 @@ def blocks_to_ibi(blocks, epoch_start_s, options, *, out_fs=FS_IBI, epoch_second
                 epoch_ok=valid_fraction >= options["min_valid_fraction"])
 
 
-def ppg_to_ibi(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, **cleaning):
+def ppg_to_ibi(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, peak_method="elgendi_local", **cleaning):
     """PPG epochs [n, fs*30] (real or generated) -> WatchSleepNet-format 25 Hz IBI [n, 750] plus beats.
 
     Consecutive epochs (by epoch_start_s) form one block; see the module docstring for the steps.
     """
     options = cleaning_options(**cleaning)
-    blocks = ppg_blocks(epochs, fs, epoch_start_s, detect_fs=detect_fs)
+    blocks = ppg_blocks(epochs, fs, epoch_start_s, detect_fs=detect_fs, peak_method=peak_method)
     result = blocks_to_ibi(blocks, epoch_start_s, options)
     n = len(epoch_start_s)
     join = lambda key: np.concatenate([b[key] for b in blocks]) if blocks else np.zeros(0)
@@ -311,7 +342,7 @@ def ppg_to_ibi(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, **cleaning):
     for block in blocks:
         sqi[block["epochs"]], beats_per_epoch[block["epochs"]] = block["sqi"], block["beats_per_epoch"]
     result.update(beat_times_s=join("beat_times_s"), beat_times_unrefined_s=join("unrefined_s"),
-                  sqi=sqi, beats_per_epoch=beats_per_epoch, options=options)
+                  sqi=sqi, beats_per_epoch=beats_per_epoch, options=options, peak_method=peak_method)
     return result
 
 
@@ -486,17 +517,18 @@ def align_beats(ecg_t, ppg_t, *, coarse=None, max_dev=4.0, min_pairs=100):
     """Two-pass tracking: find the night's typical lag, then track around it.
 
     Pass 1 tracks from a 0.3 s prior and, if the heart-rate cross-correlation suggests a large offset,
-    from that offset too; the one whose PP intervals follow the RR intervals best (median |PP - RR|)
-    gives the centre (the median tracked lag). Pass 2 tracks with every run kept within centre +- max_dev.
+    from that offset too; the offset replaces the 0.3 s prior only if its PP intervals follow the RR
+    intervals clearly better (median |PP - RR| below 80 %). The chosen track's median lag is the centre. Pass 2 tracks with every run kept within centre +- max_dev.
     Returns (track, centre); centre is None when nothing could be tracked.
     """
     candidates = [0.3] + ([float(coarse)] if coarse is not None and abs(coarse - 0.3) > 1.0 else [])
     best, best_score = None, np.inf
-    for prior in candidates:
+    for k, prior in enumerate(candidates):
         track = track_beats(ecg_t, ppg_t, priors=(prior,))
         accuracy = tracked_accuracy(ecg_t, ppg_t, track)
         score = accuracy["median_abs_ms"] if accuracy["pairs"] >= min_pairs else np.inf
-        if score < best_score:
+        # a far-away offset (e.g. DREAMT 2.1.0's ~25 s) must be clearly better than the usual small lag
+        if score < (best_score if k == 0 else 0.8 * best_score):
             best, best_score = track, score
     if best is None:
         return track_beats(ecg_t, ppg_t, priors=(0.3,), centre=0.3, max_dev=max_dev), None
@@ -684,7 +716,7 @@ def read_subject_csv(csv_path, ecg_column="ECG"):
 
 
 def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=None,
-                    relative_threshold=DEFAULT_RELATIVE_THRESHOLD, ahi=None):
+                    relative_threshold=DEFAULT_RELATIVE_THRESHOLD, peak_method="elgendi_local", ahi=None):
     """Return (arrays, report) for one raw DREAMT CSV; see the module docstring."""
     from scipy.signal import resample_poly
 
@@ -720,13 +752,16 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=
     ppg = ppg50[take50].astype(np.float32)
 
     # PPG -> IBI: the generated-PPG route (stored 50 Hz -> 100 Hz) and the original 100 Hz route
-    blocks50 = ppg_blocks(ppg, FS_PPG, start_s)
-    blocks100 = ppg_blocks(bvp[rows100], FS_RAW, start_s)
+    blocks50 = ppg_blocks(ppg, FS_PPG, start_s, peak_method=peak_method)
+    blocks100 = ppg_blocks(bvp[rows100], FS_RAW, start_s, peak_method=peak_method)
+    others = [m for m in PEAK_METHODS if m != peak_method]
+    blocks_other = {m: ppg_blocks(ppg, FS_PPG, start_s, peak_method=m) for m in others}
     variants = dict(
         ppg50_clean=blocks_to_ibi(blocks50, start_s, options),
         ppg50_relative=blocks_to_ibi(blocks50, start_s, dict(options, relative_threshold=relative_threshold)),
         ppg50_raw=blocks_to_ibi(blocks50, start_s, dict(options, max_fill_intervals=0)),
         ppg100_clean=blocks_to_ibi(blocks100, start_s, options),
+        **{f"ppg50_{m}_clean": blocks_to_ibi(blocks_other[m], start_s, options) for m in others},
     )
     main = variants["ppg50_clean"]
     join = lambda blocks, key: np.concatenate([b[key] for b in blocks]) if blocks else np.zeros(0)
@@ -769,7 +804,8 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=
         wsn_sorted = wsn_t[order]
         same_epoch = np.r_[wsn_epoch[order][1:] == wsn_epoch[order][:-1], False]
         routes = dict(ppg50=(ppg_t, None), ppg50_unrefined=(join(blocks50, "unrefined_s"), None),
-                      ppg100=(ppg100_t, None), ppg100_unrefined=(join(blocks100, "unrefined_s"), None))
+                      ppg100=(ppg100_t, None), ppg100_unrefined=(join(blocks100, "unrefined_s"), None),
+                      **{f"ppg50_{m}": (join(blocks_other[m], "beat_times_s"), None) for m in others})
         if wsn_sorted.size:
             routes["watchsleepnet"] = (wsn_sorted, same_epoch)
         tracks = {}
@@ -823,6 +859,7 @@ def extract_subject(csv_path, *, ecg_column="ECG", watchsleepnet=True, cleaning=
         epoch_runs=len(epoch_runs(start_s)),
         stage_epochs={name: int((stages == code).sum()) for name, code in STAGE_CODES.items()},
         ppg_beats=int(ppg_t.size), ppg100_beats=int(ppg100_t.size), ecg_beats=int(ecg_t.size), cleaning=options,
+        peak_method=peak_method,
         relative_threshold=relative_threshold, alignment=alignment, beat_accuracy=beats, series_accuracy=series,
         route_agreement_50_vs_100=agreement,
         epoch_ok_fraction=float(main["epoch_ok"].mean()),
