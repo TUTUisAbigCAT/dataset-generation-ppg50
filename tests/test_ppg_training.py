@@ -194,12 +194,18 @@ class TrainingTests(unittest.TestCase):
         config_path = self.folder / "tiny.json"
         config_path.write_text(json.dumps(config))
         out = self.folder / "run"
+        with self.assertRaises(SystemExit) as missing:                        # nothing to resume yet
+            train_ppg.main(["--resume", str(self.folder / "never_started"), "--device", "cpu", "--allow-cpu"])
+        self.assertIn("no config.json", str(missing.exception))
+        (out / "source").mkdir(parents=True)                                  # left by a run that never started
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             checked = train_ppg.main(["--config", str(config_path), "--output-dir", str(out), "--check-only"])
             self.assertEqual(checked["summary"]["validation_subjects"], ["S001", "S005"])
             first = train_ppg.main(["--config", str(config_path), "--output-dir", str(out), "--device", "cpu",
                                     "--allow-cpu"])
         self.assertEqual(first["status"], "completed")
+        with self.assertRaises(SystemExit):                                     # a second new run there
+            train_ppg.main(["--config", str(config_path), "--output-dir", str(out), "--device", "cpu", "--allow-cpu"])
         for name in ("config.json", "run_summary.json", "metrics.csv", "best.pt", "last.pt", "state.pt",
                      "validation/epoch_001.npz", "source/ppg_training.py"):
             self.assertTrue((out / name).exists(), name)

@@ -27,6 +27,12 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# Single-thread BLIS before NumPy/PyTorch load (as in run_dreamt.py): the cluster's multi-threaded
+# BLIS aborts in bli_l3_decor_openmp.c next to PyTorch's own OpenMP runtime.
+from host_runtime import configure_host_threads
+if __name__ == "__main__":
+    configure_host_threads(2)
+
 import ppg_training as pt
 
 
@@ -69,6 +75,9 @@ def main(argv=None):
     overrides = overrides or None
     if cli.resume is not None:
         output = cli.resume.expanduser().resolve()
+        if not (output / "config.json").is_file():
+            raise SystemExit(f"{output} has no config.json: the first run there did not start, so there is "
+                             "nothing to resume (start it again without --resume)")
         config = pt.load_config(output / "config.json", overrides)
         if overrides:                      # a longer run keeps the saved config otherwise identical
             (output / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -100,7 +109,9 @@ def main(argv=None):
 
     if trainer.device.type != "cuda" and not cli.allow_cpu:
         raise SystemExit("CUDA is required for training (use --allow-cpu only for tests)")
-    output.mkdir(parents=True, exist_ok=cli.resume is not None)
+    if cli.resume is None and (output / "config.json").exists():
+        raise SystemExit(f"{output} already holds a run; continue it with --resume {output}")
+    output.mkdir(parents=True, exist_ok=True)       # a folder left by a run that never started is reused
     snapshot_source(output / "source")
     print(json.dumps(dict(status="training", output_directory=str(output), device=str(trainer.device),
                           training_windows=summary["training_windows"],

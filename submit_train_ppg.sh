@@ -25,6 +25,10 @@ source ./.venv/bin/activate
 # $HOME and $PROJECT are read-only inside Trillium jobs: keep caches on the job's local disk.
 export XDG_CACHE_HOME="${SLURM_TMPDIR:-/tmp}/cache" MPLCONFIGDIR="${SLURM_TMPDIR:-/tmp}/matplotlib"
 mkdir -p "$XDG_CACHE_HOME" "$MPLCONFIGDIR"
+# single-thread BLIS (the multi-threaded one aborts next to PyTorch's OpenMP runtime)
+export BLIS_THREAD_IMPL=single BLIS_NUM_THREADS=1
+export BLIS_JC_NT=1 BLIS_PC_NT=1 BLIS_IC_NT=1 BLIS_JR_NT=1 BLIS_IR_NT=1
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
 
 RUN="${1:-${RUN:-}}"
 CONFIG="${CONFIG:-configs/ppg50.json}"
