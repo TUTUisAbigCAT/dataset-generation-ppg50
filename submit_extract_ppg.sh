@@ -28,8 +28,13 @@ mkdir -p "$XDG_CACHE_HOME" "$MPLCONFIGDIR"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 if ! python -c "import neurokit2" 2>/dev/null; then
-  echo "neurokit2 is missing from .venv. On a login node run:" >&2
-  echo "  source .venv/bin/activate && (pip install --no-index neurokit2 || pip install neurokit2)" >&2
+  echo "neurokit2 is missing from .venv. On a login node run (never without -c: neurokit2 0.3 pulls numpy 2):" >&2
+  echo "  source .venv/bin/activate && pip install 'neurokit2==0.2.12' -c constraints_trillium.txt" >&2
+  exit 1
+fi
+if ! python -c "import numpy, sys; sys.exit(0 if numpy.__version__.startswith('1.') else 1)"; then
+  echo "numpy $(python -c 'import numpy; print(numpy.__version__)') in .venv: torch 2.3.1 needs numpy 1.26." >&2
+  echo "  Remove it on a login node: pip uninstall -y numpy pandas   (scipy-stack's numpy 1.26.4 is used again)" >&2
   exit 1
 fi
 

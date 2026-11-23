@@ -1,0 +1,8 @@
+# Versions already in the shared Trillium environment (modules StdEnv/2023 python/3.11 scipy-stack/2024a
+# + dataset-generation-v2/.venv). Use with -c so pip never replaces them:
+#   pip install "neurokit2==0.2.12" -c constraints_trillium.txt
+# neurokit2 0.3.0 requires numpy>=2, which breaks torch 2.3.1; 0.2.12 works with numpy 1.26.
+numpy==1.26.4
+pandas==2.2.1
+scipy==1.16.2
+torch==2.3.1

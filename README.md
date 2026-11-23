@@ -36,7 +36,8 @@
 
 ```bash
 # 仓库放在 /project/def-plago/yxtao/dataset-generation-ppg50，环境沿用 v2：ln -s ../dataset-generation-v2/.venv .venv
-source .venv/bin/activate && (pip install --no-index neurokit2 || pip install neurokit2)   # 登录节点，只需一次
+source .venv/bin/activate && pip install "neurokit2==0.2.12" -c constraints_trillium.txt   # 登录节点，只需一次
+# 必须带 -c：neurokit2 0.3 会把 numpy 升到 2.x、pandas 升到 3.x，torch 2.3.1 就不能用了；constraints_trillium.txt 锁住环境里已有的版本
 SUBJECTS="S002 S092" sbatch submit_extract_ppg.sh    # 先测两个人
 sbatch submit_extract_ppg.sh                         # 全部（重交会跳过已完成的人）
 ```
