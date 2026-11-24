@@ -150,7 +150,13 @@ def refine_peaks_parabolic(signal, peaks, sampling_rate):
     return exact, exact / float(sampling_rate)
 
 
-PEAK_METHODS = ("elgendi_local", "elgendi", "charlton")
+PEAK_METHODS = ("elgendi_local", "elgendi", "charlton")          # compared in every extraction
+# the teacher's route: nk.ppg_clean at the signal's own rate, the cleaned wave upsampled to 500 Hz, nk.ppg_peaks
+# there with correct_artifacts=True (neurokit2's Kubios correction), IBI straight from those peaks
+UPSAMPLE_FS = 500
+UPSAMPLED_METHODS = ("native500", "native500_fix", "native500_local_fix")
+EXTRA_PEAK_METHODS = ("elgendi_local_fix",) + UPSAMPLED_METHODS   # scripts/compare_peak_methods.py
+ALL_PEAK_METHODS = PEAK_METHODS + EXTRA_PEAK_METHODS
 
 
 def local_rms(signal, fs, window_s):
@@ -162,37 +168,80 @@ def local_rms(signal, fs, window_s):
     return np.maximum(rms, floor)
 
 
+def _elgendi_peaks(cleaned, fs, *, local, correct, rms_window_s):
+    """nk.ppg_peaks (Elgendi) on a cleaned block, optionally on its local-RMS-normalized copy and with
+    neurokit2's artifact correction (correct_artifacts=True: signal_fixpeaks, Kubios method)."""
+    import neurokit2 as nk
+
+    x = cleaned / local_rms(cleaned, fs, rms_window_s) if local else cleaned
+    if not hasattr(nk, "ppg_peaks"):                                 # neurokit2 < 0.2.4
+        return np.asarray(nk.ppg_findpeaks(x, sampling_rate=fs, method="elgendi")["PPG_Peaks"], dtype=np.int64)
+    peaks = np.asarray(nk.ppg_peaks(x, sampling_rate=fs, method="elgendi")[1]["PPG_Peaks"], dtype=np.int64)
+    if correct and peaks.size > 3:
+        try:
+            fixed = nk.signal_fixpeaks(peaks, sampling_rate=fs, iterative=True, method="Kubios")[1]
+            fixed = np.unique(np.clip(np.round(np.asarray(fixed, dtype=np.float64)), 0, cleaned.size - 1))
+            peaks = fixed.astype(np.int64)
+        except Exception:                                            # correction failed: keep the detection
+            pass
+    return peaks
+
+
 def ppg_peaks(signal, fs, *, method="elgendi_local", rms_window_s=5.0):
     """(cleaned, integer peaks) on one contiguous block.
 
     The block is cleaned with nk.ppg_clean(method="elgendi"). Peaks:
-      elgendi_local  nk.ppg_peaks (Elgendi) on the cleaned block divided by its 5-s running RMS. Elgendi's
-                     threshold uses the mean of the squared signal over the whole input, so on a long block
-                     loud artifact periods raise it everywhere and quiet stretches lose beats; the local
-                     normalization keeps the block processing (no edge effects) with local thresholds.
-      elgendi        nk.ppg_peaks on the cleaned block as is.
-      charlton       nk.ppg_findpeaks(method="charlton"), MSPTDfast (Charlton et al.).
-    Peak refinement and SQI always use the cleaned block itself.
+      elgendi_local      nk.ppg_peaks (Elgendi) on the cleaned block divided by its 5-s running RMS. Elgendi's
+                         threshold uses the mean of the squared signal over the whole input, so on a long block
+                         loud artifact periods raise it everywhere and quiet stretches lose beats; the local
+                         normalization keeps the block processing (no edge effects) with local thresholds.
+      elgendi            nk.ppg_peaks on the cleaned block as is.
+      charlton           nk.ppg_findpeaks(method="charlton"), MSPTDfast (Charlton et al.).
+      elgendi_local_fix  elgendi_local, then neurokit2's artifact correction (correct_artifacts=True).
+    Peak refinement and SQI always use the cleaned block itself. The native500 methods are upsampled_peaks.
     """
     import neurokit2 as nk
 
-    if method not in PEAK_METHODS:
-        raise ValueError(f"peak method must be one of {PEAK_METHODS}")
+    if method not in PEAK_METHODS + ("elgendi_local_fix",):
+        raise ValueError(f"peak method must be one of {PEAK_METHODS + ('elgendi_local_fix',)}")
     signal, _ = _fill_nan(signal)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         cleaned = np.asarray(nk.ppg_clean(signal, sampling_rate=fs, method="elgendi"), dtype=np.float64)
         try:
             if method == "charlton":
-                peaks = nk.ppg_findpeaks(cleaned, sampling_rate=fs, method="charlton")["PPG_Peaks"]
+                peaks = np.asarray(nk.ppg_findpeaks(cleaned, sampling_rate=fs, method="charlton")["PPG_Peaks"],
+                                   dtype=np.int64)
             else:
-                x = cleaned / local_rms(cleaned, fs, rms_window_s) if method == "elgendi_local" else cleaned
-                if hasattr(nk, "ppg_peaks"):
-                    peaks = nk.ppg_peaks(x, sampling_rate=fs, method="elgendi")[1]["PPG_Peaks"]
-                else:                                    # neurokit2 < 0.2.4
-                    peaks = nk.ppg_findpeaks(x, sampling_rate=fs, method="elgendi")["PPG_Peaks"]
-            peaks = np.asarray(peaks, dtype=np.int64)
+                peaks = _elgendi_peaks(cleaned, fs, local=method != "elgendi", correct=method.endswith("_fix"),
+                                       rms_window_s=rms_window_s)
         except Exception:                                # flat or too short signal
+            peaks = np.zeros(0, dtype=np.int64)
+    return cleaned, peaks
+
+
+def upsampled_peaks(signal, fs, *, method="native500_fix", upsample_fs=UPSAMPLE_FS, rms_window_s=5.0):
+    """The teacher's route on one block: (cleaned at upsample_fs, integer peaks at upsample_fs).
+
+    1. nk.ppg_clean(method="elgendi") at the signal's own rate fs;
+    2. the cleaned (smooth, band-limited) wave upsampled to upsample_fs (500 Hz);
+    3. nk.ppg_peaks (Elgendi) there; native500_fix and native500_local_fix with correct_artifacts=True,
+       native500_local_fix on the local-RMS-normalized wave as elgendi_local.
+    Peak times are peaks / upsample_fs (no parabolic refinement: 2 ms steps).
+    """
+    import neurokit2 as nk
+
+    if method not in UPSAMPLED_METHODS:
+        raise ValueError(f"upsampled peak method must be one of {UPSAMPLED_METHODS}")
+    signal, _ = _fill_nan(signal)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cleaned = np.asarray(nk.ppg_clean(signal, sampling_rate=fs, method="elgendi"), dtype=np.float64)
+        cleaned = resample_to(cleaned, fs, upsample_fs)
+        try:
+            peaks = _elgendi_peaks(cleaned, upsample_fs, local=method == "native500_local_fix",
+                                   correct=method.endswith("_fix"), rms_window_s=rms_window_s)
+        except Exception:
             peaks = np.zeros(0, dtype=np.int64)
     return cleaned, peaks
 
@@ -246,16 +295,24 @@ def ppg_blocks(epochs, fs, epoch_start_s, *, detect_fs=FS_DETECT, epoch_seconds=
     starts = np.asarray(epoch_start_s, dtype=np.float64)
     if starts.shape != (epochs.shape[0],):
         raise ValueError("epoch_start_s needs one start time per epoch")
-    per_epoch = int(round(detect_fs * epoch_seconds))
+    if peak_method not in ALL_PEAK_METHODS:
+        raise ValueError(f"peak method must be one of {ALL_PEAK_METHODS}")
+    upsampled = peak_method in UPSAMPLED_METHODS
+    rate = UPSAMPLE_FS if upsampled else detect_fs
+    per_epoch = int(round(rate * epoch_seconds))
     blocks = []
     for run in epoch_runs(starts, epoch_seconds):
-        signal = resample_to(epochs[run].reshape(-1), fs, detect_fs)
-        cleaned, peaks = ppg_peaks(signal, detect_fs, method=peak_method)
-        _, times = refine_peaks_parabolic(cleaned, peaks, detect_fs)
+        if upsampled:                                    # cleaned at the stored rate, peaks at 500 Hz
+            cleaned, peaks = upsampled_peaks(epochs[run].reshape(-1), fs, method=peak_method)
+            times = peaks / float(rate)
+        else:
+            signal = resample_to(epochs[run].reshape(-1), fs, detect_fs)
+            cleaned, peaks = ppg_peaks(signal, detect_fs, method=peak_method)
+            _, times = refine_peaks_parabolic(cleaned, peaks, detect_fs)
         bounds = [(k * per_epoch, (k + 1) * per_epoch) for k in range(run.size)]
         blocks.append(dict(epochs=run, beat_times_s=times + starts[run[0]],
-                           unrefined_s=peaks / float(detect_fs) + starts[run[0]],
-                           sqi=template_sqi(cleaned, peaks, detect_fs, bounds),
+                           unrefined_s=peaks / float(rate) + starts[run[0]],
+                           sqi=template_sqi(cleaned, peaks, rate, bounds),
                            beats_per_epoch=np.bincount(peaks // per_epoch, minlength=run.size)[:run.size]))
     return blocks
 

@@ -43,6 +43,7 @@ source .venv/bin/activate && pip install "neurokit2==0.2.12" -c constraints_tril
 # 必须带 -c：neurokit2 0.3 会把 numpy 升到 2.x、pandas 升到 3.x，torch 2.3.1 就不能用了；constraints_trillium.txt 锁住环境里已有的版本
 SUBJECTS="S002 S092" sbatch submit_extract_ppg.sh    # 先测两个人
 sbatch submit_extract_ppg.sh                         # 全部（重交会跳过已完成的人）
+sbatch submit_compare_peaks.sh                       # 找峰方法对比（只读提取结果）：现用路线、+correct_artifacts、老师的 50 Hz 清洗→500 Hz→correct_artifacts，均与 ECG 比
 ```
 
 先看 `report.csv`：`route_50_vs_100_reference_matched` 和 `route_50_vs_100_ibi_median_abs_ms`（50 Hz 的损失）；`ecg_irregular`、`tracked_fraction`、`lag_median_s`；各 IBI 与 ECG 的 `*_mae_ms`、`*_big_error_fraction`（相差 > 100 ms 的比例，只在能跟踪到 ECG 的位置上算，`reference_coverage` 为其比例）；`epoch_ok_fraction`。注意：做分类实验时，生成模型只能用分类训练集里的人训练，否则测试集的人会泄漏进生成数据。

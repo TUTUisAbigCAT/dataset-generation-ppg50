@@ -248,6 +248,63 @@ class PpgToIbiTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             px.ppg_peaks(signal, fs, method="other")
 
+    def test_teacher_route_500_hz_and_artifact_correction(self):
+        starts = np.array([0.0, 30.0, 60.0, 90.0])
+        t = np.arange(0, 120, 1 / 50)
+        jittered = self.beats + np.random.default_rng(0).normal(0, 0.01, self.beats.size)   # real IBIs vary
+        missed = sum(np.exp(-0.5 * ((t - b) / 0.07) ** 2) for b in np.delete(jittered, 75))
+        for method in px.EXTRA_PEAK_METHODS:
+            result = px.ppg_to_ibi(self.signal.reshape(4, 1500), 50, starts, peak_method=method)
+            found = result["beat_times_s"]
+            matched = px.match_beats(self.beats, found, 0.0, tolerance=0.05)
+            self.assertGreater((matched >= 0).mean(), 0.98, method)
+            self.assertLess(np.median(np.abs(found[matched[matched >= 0]] - self.beats[matched >= 0])), 0.002, method)
+            self.assertTrue(result["epoch_ok"].all(), method)
+            self.assertEqual(int(result["beats_per_epoch"].sum()), found.size, method)
+            self.assertGreater(float(result["sqi"].min()), 0.95, method)
+            gap = px.ppg_to_ibi(missed.reshape(4, 1500), 50, starts, peak_method=method)["beat_times_s"]
+            if method.endswith("_fix"):                    # the Kubios correction puts the missed beat back
+                self.assertLess(np.diff(gap).max(), 1.0, method)
+            else:
+                self.assertGreater(np.diff(gap).max(), 1.5, method)
+        cleaned, peaks = px.upsampled_peaks(self.signal[:1500], 50, method="native500")
+        self.assertEqual(cleaned.size, 15000)                # cleaned at 50 Hz, then 500 Hz
+        self.assertTrue(np.all(np.diff(peaks) > 0))
+        with self.assertRaises(ValueError):
+            px.upsampled_peaks(self.signal[:1500], 50, method="elgendi")
+        with self.assertRaises(ValueError):
+            px.ppg_to_ibi(self.signal.reshape(4, 1500), 50, starts, peak_method="other")
+
+    def test_compare_script_scores_routes_against_ecg(self):
+        from scripts import compare_peak_methods
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data, out = Path(tmp) / "data", Path(tmp) / "out"
+            data.mkdir()
+            np.savez_compressed(data / "S001.npz", schema=np.array(px.SCHEMA), fs_ppg=np.array(50),
+                                ppg=self.signal.reshape(4, 1500).astype(np.float32),
+                                epoch_start_s=np.array([0.0, 30.0, 60.0, 90.0]), epoch_index=np.arange(4),
+                                grid_offset_rows=np.array(0), ecg_peaks_s=self.beats - 0.3)
+            np.savez_compressed(data / "S002.npz", schema=np.array("ppg50_night_generation_v2"))
+            methods = ["elgendi_local", "native500_fix"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                summary = compare_peak_methods.main(["--data-dir", str(data), "--output-dir", str(out),
+                                                     "--methods", *methods])
+            self.assertEqual(summary["skipped"], ["S002"])
+            regular = summary["groups"]["regular"]
+            self.assertEqual(regular["participants"], 1)
+            for method in methods:
+                values = regular["methods"][method]
+                self.assertGreater(values["sensitivity"], 0.95, method)
+                self.assertLess(values["beat_ibi_mae_ms"], 5.0, method)
+                self.assertLess(values["series_mae_ms"], 10.0, method)
+            rows = (out / "compare.csv").read_text().splitlines()
+            self.assertEqual(len(rows), 1 + len(methods))
+            with contextlib.redirect_stdout(io.StringIO()):            # resumes without recomputing
+                again = compare_peak_methods.main(["--data-dir", str(data), "--output-dir", str(out),
+                                                   "--methods", *methods])
+            self.assertEqual(again["groups"]["regular"]["methods"], regular["methods"])
+
     def test_shapes_are_checked_and_flat_input_gives_zeros(self):
         with self.assertRaises(ValueError):
             px.ppg_to_ibi(np.zeros((2, 1000)), 50, np.array([0.0, 30.0]))
