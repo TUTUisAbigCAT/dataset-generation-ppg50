@@ -11,7 +11,6 @@ Rows 3-5: real and generated windows of the same epochs at the 10th, 50th and 90
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import sys
 
@@ -102,6 +101,7 @@ def main(argv=None):
 
     raw_dir = cli.raw_ppg_dir
     if raw_dir is None:
+        import json
         raw_dir = Path(json.loads((out / "generation.json").read_text())["data_dir"])
     flat = [(d["sid"], k, d["gen"]["templatematch"][k]) for d in data for k in range(len(d["stages"]))
             if np.isfinite(d["gen"]["templatematch"][k])]
@@ -127,11 +127,7 @@ def main(argv=None):
                          f"percentile)", fontsize=10, loc="left")
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
-    pending = []
-    if (out / "summary.json").is_file():
-        pending = json.loads((out / "summary.json").read_text(encoding="utf-8")).get("pending") or []
-    note = f"; {len(pending)} not generated yet: {' '.join(pending[:8])}{' ...' if len(pending) > 8 else ''}" if pending else ""
-    fig.suptitle(f"PPG quality, generated vs real ({len(data)} participants, {len(pooled['gen']['beats'])} windows{note})",
+    fig.suptitle(f"PPG quality, generated vs real ({len(data)} participants, {len(pooled['gen']['beats'])} windows)",
                  fontsize=14)
     target = out / "quality_comparison.png"
     fig.savefig(target, dpi=90)

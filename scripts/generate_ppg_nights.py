@@ -114,20 +114,18 @@ def flat_row(metrics, extra):
     return row
 
 
-def write_summary(output, rows, expected=()):
-    """subjects_summary.csv and summary.json; participants of `expected` not generated yet are listed as pending."""
-    pending = sorted(s for s in expected if s not in rows)
+def write_summary(output, rows):
     with (output / "subjects_summary.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        for sid in sorted(set(rows) | set(pending)):
-            writer.writerow(rows.get(sid) or dict(subject=sid, status="pending"))
+        for sid in sorted(rows):
+            writer.writerow(rows[sid])
     done = [r for r in rows.values() if r.get("status") in ("written", "kept_existing")]
     def median(key, subset=done):
         values = [float(r[key]) for r in subset if r.get(key) not in (None, "")]
         return float(np.median(values)) if values else None
     regular = [r for r in done if not r.get("ecg_irregular")]
-    summary = dict(schema=pg.SCHEMA, subjects=len(rows) + len(pending), written=len(done), pending=pending,
+    summary = dict(schema=pg.SCHEMA, subjects=len(rows), written=len(done),
                    failed=sorted(s for s, r in rows.items() if r.get("status") == "failed"),
                    median={k: median(k) for k in CSV_FIELDS if k not in ("subject", "status", "error")
                            and any(isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool) for r in done)},
@@ -224,9 +222,7 @@ def main(argv=None):
             continue
         if cli.max_hours is not None and durations and \
                 (time.time() - started + 1.5 * max(durations)) / 3600.0 > cli.max_hours:
-            left = [s for s in subjects if s not in rows]
-            print(json.dumps(dict(event="paused_for_time", next_subject=sid, remaining=left,
-                                  rerun_same_command=True)), flush=True)
+            print(json.dumps(dict(event="paused_for_time", next_subject=sid, rerun_same_command=True)), flush=True)
             break
         t0 = time.time()
         try:
@@ -259,8 +255,8 @@ def main(argv=None):
                                                  "templatematch_below_0.8_real", "skewness_median_gen",
                                                  "skewness_median_real", "w1_ms", "seconds", "error")},
                          default=float), flush=True)
-        write_summary(output, rows, subjects)
-    summary = write_summary(output, rows, subjects)
+        write_summary(output, rows)
+    summary = write_summary(output, rows)
     remaining = [s for s in subjects if s not in rows]
     status = "completed" if not remaining and not summary["failed"] else ("paused" if remaining else "completed_with_failures")
     print(json.dumps(dict(event="done", status=status, written=summary["written"], failed=summary["failed"],
