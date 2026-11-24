@@ -80,6 +80,7 @@ sbatch submit_generate_ppg_nights.sh RUN_DIR [LABEL]                            
 sbatch submit_generate_ppg_nights.sh RUN_DIR e050 epoch050.pt                             # 指定检查点（第 3 个参数；Trillium 的 sbatch 不传环境变量，CHECKPOINT=... sbatch 无效）
 python scripts/plot_ppg_quality.py OUT                                                   # -> OUT/quality_comparison.png
 python scripts/analyze_ppg_quality.py OUT [OUT2 ...] --labels e050 e146               # 全体 + 按分期（W/N1/N2/Light/Deep/REM）：分布、质量分档、同一 epoch 一致性、C2ST AUC
+python scripts/ppg_nights_to_ibi.py --nights OUT --workers $(nproc)                    # 已生成的 PPG（和真实 PPG）逐窗口转 IBI 并比较，不用 GPU；另写 WatchSleepNet 格式整夜文件
 ```
 
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）
