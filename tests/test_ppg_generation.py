@@ -155,6 +155,16 @@ class NightGenerationTests(unittest.TestCase):
             self.generate(out, "--checkpoint", "epoch050.pt", "--ibi", "--quality-threshold", "0.8")
         self.assertIn("use a new --output-dir", str(refused.exception))
         other.unlink()
+        paused = self.folder / "nights_paused"                                  # time guard after one participant
+        result = self.generate(paused, "--subjects", "S001", "S002", "S003", "--max-hours", "1e-9")
+        self.assertEqual(result["status"], "paused")
+        rows = list(csv.DictReader((paused / "subjects_summary.csv").read_text().splitlines()))
+        self.assertEqual([(r["subject"], r["status"]) for r in rows],
+                         [("S001", "written"), ("S002", "pending"), ("S003", "pending")])
+        self.assertEqual(json.loads((paused / "summary.json").read_text())["pending"], ["S002", "S003"])
+        from scripts import plot_ppg_quality
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(Path(plot_ppg_quality.main([str(paused)])).is_file())
         twin = self.folder / "nights_twin"
         self.generate(twin, "--subjects", "S001", "--ibi", "--quality-threshold", "0.8")
         with np.load(twin / "subjects" / "S001.npz") as z:
