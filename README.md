@@ -81,7 +81,7 @@ sbatch submit_generate_ppg_nights.sh RUN_DIR e050 epoch050.pt                   
 python scripts/plot_ppg_quality.py OUT                                                   # -> OUT/quality_comparison.png
 python scripts/analyze_ppg_quality.py OUT [OUT2 ...] --labels e050 e146               # 全体 + 按分期（W/N1/N2/Light/Deep/REM）：分布、质量分档、同一 epoch 一致性、C2ST AUC
 python scripts/ppg_nights_to_ibi.py --nights OUT --workers $(nproc)                    # 已生成的 PPG（和真实 PPG）逐窗口转 IBI 并比较，不用 GPU；另写 WatchSleepNet 格式整夜文件
-python scripts/ibi_kde_spectrum.py --ibi OUT/ibi_elgendi_local_fix --workers $(nproc)    # 上一步的 IBI：KDE（IBI 与心率）、整夜与 30 秒窗口频谱、分 stage 的心率/HRV 与 stage 差异，只读
+python scripts/ibi_kde_spectrum.py --ibi OUT/ibi_elgendi_local_fix --workers $(nproc)    # 上一步的 IBI：IBI 的 KDE、FFT 频谱、心率图，各出全部与分 stage 两张（--extra-figures 另出整夜频谱、HRV、stage 差异；--plot-only DIR 只重画），只读
 ```
 
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）

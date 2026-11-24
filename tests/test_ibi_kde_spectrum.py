@@ -45,13 +45,22 @@ class IbiKdeSpectrumTest(unittest.TestCase):
                                     epoch_index=np.arange(len(stages)), apnea_25hz=np.zeros((len(stages), 750), np.uint8),
                                     peak_method=np.array("elgendi_local_fix"))
             with contextlib.redirect_stdout(io.StringIO()):
-                summary = ks.main(["--ibi", str(folder), "--workers", "2"])
+                summary = ks.main(["--ibi", str(folder), "--workers", "2", "--extra-figures"])
             out = folder / "kde_spectrum"
-            for name in ("kde_ibi_hr.png", "spectrum_night.png", "spectrum_stage.png", "stage_hr_hrv.png",
+            simple = [f"fig_{kind}_{part}.png" for kind in ("kde_ibi", "fft", "hr") for part in ("all", "stages")]
+            for name in (*simple, "kde_ibi_hr.png", "spectrum_night.png", "spectrum_stage.png", "stage_hr_hrv.png",
                          "stage_contrast.png", "participant_stage_metrics.csv", "night_band_power.csv",
-                         "psd_stage.csv", "kde_spectrum_summary.json"):
+                         "psd_stage.csv", "kde_curves.csv", "kde_spectrum_summary.json"):
                 self.assertTrue((out / name).is_file(), name)
             self.assertEqual(summary["participants"], 3)
+            self.assertEqual(summary["windows"]["ALL"], 3 * len(stages))
+            self.assertEqual(summary["windows"]["Deep"], 3 * 10)
+            for name in simple:                                   # re-drawn from the CSV/JSON alone
+                (out / name).unlink()
+            with contextlib.redirect_stdout(io.StringIO()):
+                ks.main(["--plot-only", str(out)])
+            for name in simple:
+                self.assertTrue((out / name).is_file(), name)
             deep = summary["stage_metrics"]["Deep"]["hr_bpm"]
             self.assertAlmostEqual(deep["real_median"], 54, delta=1.5)
             self.assertAlmostEqual(deep["gen_median"], 60, delta=1.5)

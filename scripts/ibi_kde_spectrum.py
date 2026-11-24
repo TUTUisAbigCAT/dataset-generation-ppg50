@@ -1,12 +1,20 @@
 r"""KDE, spectrum, heart rate and HRV of real vs generated IBI, overall and per sleep stage (CPU only, reads only).
 
   python scripts/ibi_kde_spectrum.py --ibi NIGHTS/ibi_elgendi_local_fix [--output-dir DIR] [--workers N]
+  python scripts/ibi_kde_spectrum.py --plot-only DIR          # re-draw the figures from DIR's CSV/JSON only
 
 Reads IBI_DIR/subjects/S*.npz from scripts/ppg_nights_to_ibi.py: the 25 Hz IBI (s) of every 30-s window,
 generated and real (both from PPG through the same route), the sample status (0 measured, 1 filled,
 2 artifact, 3 no beat) and the PSG stage. Valid samples are IBI > 0. Output in --output-dir
 (default IBI_DIR/kde_spectrum):
 
+  The figures, each for all stages together (_all) and for W/N1/N2/Deep/REM side by side (_stages):
+  fig_kde_ibi_*.png     KDE of the IBI values (s), real vs generated
+  fig_fft_*.png         IBI spectrum inside 30-s windows (median and IQR over participants), real vs generated
+  fig_hr_*.png          KDE of heart rate (60 / IBI, bpm), real vs generated
+  They are drawn only from kde_curves.csv, psd_stage.csv and kde_spectrum_summary.json (see --plot-only).
+
+  With --extra-figures also the detailed figures:
   kde_ibi_hr.png        KDE of IBI (s) and of heart rate (60 / IBI, bpm), all stages and W/N1/N2/Deep/REM,
                         pooled valid samples (5 per second), Gaussian kernel SD = 0.03 x SD of the real values
                         (bw_method=0.03 as in compare_night_generations.py)
@@ -20,7 +28,7 @@ generated and real (both from PPG through the same route), the sample status (0 
   stage_hr_hrv.png      per participant and stage: heart rate, RMSSD and SD inside a window, LF and HF power,
                         HF centre frequency (breathing rate), real vs generated (median and IQR over participants)
   stage_contrast.png    per participant, stage minus N2 of heart rate and HF power, real vs generated
-  participant_stage_metrics.csv, night_band_power.csv, psd_stage.csv, kde_spectrum_summary.json
+  participant_stage_metrics.csv, night_band_power.csv, psd_stage.csv, kde_curves.csv, kde_spectrum_summary.json
 
 RMSSD uses successive measured intervals only (a run of identical 25 Hz values with status 0 is one interval).
 The HF centre is the power-weighted mean frequency of 0.15-0.4 Hz of the mean window PSD (breathing rate; the
@@ -63,13 +71,20 @@ INK, MUTED, GRID = "#52514e", "#8a8985", "#e4e3df"
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--ibi", type=Path, required=True, help="a ppg_nights_to_ibi.py output folder")
+    parser.add_argument("--ibi", type=Path, help="a ppg_nights_to_ibi.py output folder")
     parser.add_argument("--output-dir", type=Path, help="default: IBI/kde_spectrum")
     parser.add_argument("--subjects", nargs="*")
     parser.add_argument("--exclude", nargs="*", default=[], help="participants to leave out")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--no-figures", action="store_true")
-    return parser.parse_args(argv)
+    parser.add_argument("--extra-figures", action="store_true",
+                        help="also the detailed figures (night spectrum, HR/HRV by stage, stage contrasts)")
+    parser.add_argument("--plot-only", type=Path, metavar="DIR",
+                        help="only re-draw the figures from an earlier output folder (no IBI data needed)")
+    args = parser.parse_args(argv)
+    if args.ibi is None and args.plot_only is None:
+        parser.error("give --ibi (or --plot-only DIR)")
+    return args
 
 
 # --------------------------------------------------------------------------- per participant
@@ -182,7 +197,8 @@ def analyze_subject(task):
     valid_fraction = {s: (data[s][0] > 0).mean(axis=1) for s in SOURCES}
     paired = (valid_fraction["gen"] >= MIN_VALID) & (valid_fraction["real"] >= MIN_VALID)
     result = dict(subject=sid, epochs=int(len(stages)), paired_windows=int(paired.sum()), metrics={}, pooled={},
-                  night={}, frequency=None)
+                  night={}, frequency=None, windows={g: int(len(stages)) if g == "ALL" else int((stages == c).sum())
+                                                     for g, c in (("ALL", None),) + STAGES})
     spectra = {}
     for source in SOURCES:
         ibi, status = data[source]
@@ -280,6 +296,7 @@ def contrast(results, stage, metric):
 
 def summarize(results, pooled, args, ibi_dir):
     summary = dict(participants=len(results), ibi_dir=str(ibi_dir), excluded=sorted(args.exclude),
+                   windows={g: int(sum(r["windows"][g] for r in results)) for g in GROUPS},
                    peak_method=None, kde={}, night_spectrum={}, window_spectrum={}, stage_metrics={},
                    stage_contrasts={}, settings=dict(kde_samples_per_second=FS // KDE_STEP, kde_sigma="0.03 x SD real",
                                                      night_nperseg_s=NPERSEG / FS, window_min_valid=MIN_VALID,
@@ -355,6 +372,132 @@ def stage_psd(results, group, source, both=True):
     return np.array(rows) if rows else None
 
 
+KDE_SPECS = (("ibi_s", np.linspace(0.3, 2.0, 851), lambda v: v), ("hr_bpm", np.linspace(30, 200, 851), lambda v: 60 / v))
+
+
+def write_kde_curves(output, pooled):
+    """KDE curves of IBI (s) and heart rate (bpm) per group; kernel SD = 0.03 x SD of all real values."""
+    real_all = pooled["real"][0].astype(np.float64)
+    with (output / "kde_curves.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("variable", "group", "x", "real", "gen"))
+        for variable, grid, transform in KDE_SPECS:
+            sigma = 0.03 * float(np.std(transform(real_all)))
+            for group in GROUPS:
+                curves = {}
+                for source in SOURCES:
+                    values, codes = pooled[source]
+                    values = values if group == "ALL" else values[codes == dict(STAGES)[group]]
+                    curves[source] = (binned_kde(transform(values.astype(np.float64)), grid, sigma)
+                                      if values.size > 1 else np.full(grid.size, np.nan))
+                for x, a, b in zip(grid, curves["real"], curves["gen"]):
+                    writer.writerow((variable, group, f"{x:.4f}", f"{a:.6g}", f"{b:.6g}"))
+
+
+def read_rows(path):
+    with Path(path).open(newline="", encoding="utf-8") as stream:
+        return list(csv.DictReader(stream))
+
+
+def simple_figures(output):
+    """KDE of IBI, FFT and heart rate, all stages (_all) and per stage (_stages), from the CSV/JSON outputs."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output = Path(output)
+    summary = json.loads((output / "kde_spectrum_summary.json").read_text(encoding="utf-8"))
+    kde = {}
+    for row in read_rows(output / "kde_curves.csv"):
+        kde.setdefault((row["variable"], row["group"]), []).append((float(row["x"]), float(row["real"]),
+                                                                    float(row["gen"])))
+    kde = {key: np.array(value).T for key, value in kde.items()}
+    psd = {}
+    for row in read_rows(output / "psd_stage.csv"):
+        psd.setdefault((row["stage"], row["source"]), []).append(
+            (float(row["frequency_hz"]), float(row["median_ms2_per_hz"]), float(row["q1"]), float(row["q3"]),
+             int(row["participants"])))
+    psd = {key: np.array(value).T for key, value in psd.items()}
+    plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "axes.grid": True,
+                         "grid.color": GRID, "grid.linewidth": 0.6, "axes.edgecolor": MUTED, "font.size": 10,
+                         "axes.titlesize": 11, "axes.labelcolor": INK, "xtick.color": INK, "ytick.color": INK,
+                         "axes.axisbelow": True})
+    n = summary["participants"]
+    stages = [name for name, _ in STAGES]
+    series = (("real", REAL_COLOR, "Real", 2.0), ("gen", GEN_COLOR, "Generated", 1.8))
+
+    def kde_panel(ax, group, variable, key, unit, limits, label):
+        if (variable, group) not in kde:
+            return
+        x, *curves = kde[(variable, group)]
+        for (source, color, name, width), y in zip(series, curves):
+            ax.plot(x, y, color=color, lw=width, label=name)
+        stats = summary["kde"][group][key]
+        if stats:
+            digits = 1 if unit == "ms" else 2
+            middle = ".0f" if unit == "ms" else ".1f"
+            ax.text(0.97, 0.96, f"W1 {stats['w1']:.{digits}f} {unit}\nmedian {stats['median_real']:{middle}} / "
+                    f"{stats['median_gen']:{middle}} {unit}", transform=ax.transAxes, ha="right", va="top",
+                    fontsize=9, color=INK)
+        ax.set_xlim(*limits)
+        ax.set_xlabel(label)
+
+    def fft_panel(ax, group):
+        if (group, "real") not in psd:
+            return
+        for low, high, band in (*LF, "LF"), (*HF, "HF"):
+            ax.axvspan(low, high, color="#f4f3f0" if band == "LF" else "#ebeae6", zorder=0)
+            ax.text((low + high) / 2, 0.98, band, transform=ax.get_xaxis_transform(), ha="center", va="top",
+                    fontsize=9, color=INK)
+        for source, color, name, width in series:
+            f, median, q1, q3, _ = psd[(group, source)]
+            shown = f > 0
+            ax.fill_between(f[shown], 10 * np.log10(q1[shown]), 10 * np.log10(q3[shown]), color=color, alpha=0.14,
+                            lw=0)
+            ax.plot(f[shown], 10 * np.log10(median[shown]), color=color, lw=width, label=name)
+        ax.set_xlim(0.02, MAX_FREQUENCY)
+        ax.set_xlabel("frequency (Hz)")
+
+    def subtitle(group, kind):
+        if kind == "fft" and (group, "real") in psd:
+            windows = summary["window_spectrum"][group]["windows"]
+            return f"{int(psd[(group, 'real')][4][0])} participants, {windows} windows"
+        return f"{summary['windows'][group]} windows"
+
+    kinds = (
+        ("kde_ibi", "IBI distribution (KDE)", "density",
+         lambda ax, g: kde_panel(ax, g, "ibi_s", "ibi_ms", "ms", (0.4, 1.7), "IBI (s)")),
+        ("fft", "IBI spectrum inside 30-s windows (median and IQR over participants)", "PSD (dB re 1 ms²/Hz)",
+         fft_panel),
+        ("hr", "Heart rate distribution (KDE)", "density",
+         lambda ax, g: kde_panel(ax, g, "hr_bpm", "hr_bpm", "bpm", (35, 125), "Heart rate (bpm)")),
+    )
+    written = []
+    for kind, title, ylabel, draw in kinds:
+        fig, ax = plt.subplots(figsize=(6.6, 4.3))
+        draw(ax, "ALL")
+        ax.set_ylabel(ylabel)
+        detail = subtitle("ALL", kind) if kind == "fft" else f"{n} participants, {subtitle('ALL', kind)}"
+        ax.set_title(f"{title}\nall stages; {detail}", color=INK)
+        legend(fig, [ax], loc="lower left" if kind == "fft" else "upper left", fontsize=9)
+        fig.tight_layout()
+        fig.savefig(output / f"fig_{kind}_all.png", dpi=170)
+        plt.close(fig)
+        fig, axes = plt.subplots(1, len(stages), figsize=(3.5 * len(stages), 4.0), sharex=True, sharey=True)
+        for ax, stage in zip(axes, stages):
+            draw(ax, stage)
+            ax.set_title(f"{stage}\n{subtitle(stage, kind)}", color=INK)
+        axes[0].set_ylabel(ylabel)
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper right", ncol=2, frameon=False, fontsize=10)
+        fig.suptitle(f"{title}, by sleep stage ({n} participants)", color=INK, fontsize=12, x=0.01, ha="left")
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+        fig.savefig(output / f"fig_{kind}_stages.png", dpi=170)
+        plt.close(fig)
+        written += [f"fig_{kind}_all.png", f"fig_{kind}_stages.png"]
+    return written
+
+
 def legend(fig, axes, **options):
     """One legend from the labelled artists of any panel (a panel can be empty)."""
     seen = {}
@@ -366,7 +509,7 @@ def legend(fig, axes, **options):
 
 
 # --------------------------------------------------------------------------- figures
-def figures(output, results, pooled, summary):
+def detail_figures(output, results, pooled, summary):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -594,6 +737,10 @@ def print_summary(summary):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.plot_only is not None:
+        written = simple_figures(args.plot_only.expanduser().resolve())
+        print("written:", ", ".join(written))
+        return None
     ibi_dir = args.ibi.expanduser().resolve()
     output = (args.output_dir or ibi_dir / "kde_spectrum").expanduser().resolve()
     sids = sorted(p.stem for p in (ibi_dir / "subjects").glob("S*.npz"))
@@ -614,8 +761,11 @@ def main(argv=None):
     summary = summarize(results, pooled, args, ibi_dir)
     (output / "kde_spectrum_summary.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     write_tables(output, results)
+    write_kde_curves(output, pooled)
     if not args.no_figures:
-        figures(output, results, pooled, summary)
+        simple_figures(output)
+        if args.extra_figures:
+            detail_figures(output, results, pooled, summary)
     print_summary(summary)
     print(f"\noutput: {output}")
     return summary
