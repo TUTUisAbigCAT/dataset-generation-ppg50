@@ -159,6 +159,10 @@ def main(argv=None):
             raise SystemExit(f"{output} was generated with other options {manifest['options']}; use a new --output-dir")
         if pg.sha256_file(frozen) != manifest["checkpoint"]["sha256"]:
             raise SystemExit(f"{frozen} changed since the first run; use a new --output-dir")
+        first = Path(manifest["checkpoint"]["source"]).expanduser().resolve()
+        if first != source.resolve():
+            raise SystemExit(f"{output} was generated from {first} (epoch {manifest['checkpoint'].get('epoch')}), "
+                             f"not {source}; use a new --output-dir (LABEL)")
     else:
         if not source.is_file():
             raise SystemExit(f"Checkpoint not found: {source}")
@@ -195,6 +199,10 @@ def main(argv=None):
                                                           epoch=weights.get("epoch"), validation=weights.get("validation")),
                         run=str(run), options=dict(options, batch_size=cli.batch_size), data_dir=config["data_dir"])
         manifest_path.write_text(json.dumps(manifest, indent=2, default=float), encoding="utf-8")
+    print(json.dumps(dict(status="generating", **dict(info, checkpoint_epoch=manifest["checkpoint"].get("epoch"),
+                                                     checkpoint=manifest["checkpoint"]["source"]),
+                          checkpoint_validation_ibi_w1_ms=(manifest["checkpoint"].get("validation") or {}).get("ibi_w1_ms")),
+                     default=float), flush=True)
     schedule = pt.build_diffusion(config, device)
     report = cohort.report
     rows, started, durations = {}, time.time(), []

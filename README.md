@@ -76,7 +76,7 @@ for i in 1 2 3; do J=$(sbatch --parsable --dependency=afterany:$J submit_train_p
 ```bash
 python -B scripts/generate_ppg_nights.py --run RUN_DIR --output-dir OUT --check-only      # 登录节点
 sbatch submit_generate_ppg_nights.sh RUN_DIR [LABEL]                                     # 默认 best.pt，只做质量
-CHECKPOINT=epoch050.pt sbatch submit_generate_ppg_nights.sh RUN_DIR e050                 # 指定检查点
+sbatch submit_generate_ppg_nights.sh RUN_DIR e050 epoch050.pt                             # 指定检查点（第 3 个参数；Trillium 的 sbatch 不传环境变量，CHECKPOINT=... sbatch 无效）
 python scripts/plot_ppg_quality.py OUT                                                   # -> OUT/quality_comparison.png
 ```
 

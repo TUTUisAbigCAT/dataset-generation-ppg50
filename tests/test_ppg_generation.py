@@ -6,6 +6,7 @@ import csv
 import importlib.util
 import io
 import json
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -148,6 +149,12 @@ class NightGenerationTests(unittest.TestCase):
             np.testing.assert_array_equal(z["generated_ppg"], generated)
         with self.assertRaises(SystemExit):                                     # other options, same folder
             self.generate(out, "--seed", "7", "--ibi", "--quality-threshold", "0.8")
+        other = self.run_dir / "epoch050.pt"
+        shutil.copy2(self.run_dir / "best.pt", other)
+        with self.assertRaises(SystemExit) as refused:                         # another checkpoint, same folder
+            self.generate(out, "--checkpoint", "epoch050.pt", "--ibi", "--quality-threshold", "0.8")
+        self.assertIn("use a new --output-dir", str(refused.exception))
+        other.unlink()
         twin = self.folder / "nights_twin"
         self.generate(twin, "--subjects", "S001", "--ibi", "--quality-threshold", "0.8")
         with np.load(twin / "subjects" / "S001.npz") as z:
