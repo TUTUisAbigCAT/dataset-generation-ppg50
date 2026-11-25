@@ -84,6 +84,29 @@ python scripts/ppg_nights_to_ibi.py --nights OUT --workers $(nproc)             
 python scripts/ibi_kde_spectrum.py --ibi OUT/ibi_elgendi_local_fix --workers $(nproc)    # 上一步的 IBI：IBI 的 KDE、FFT 频谱、心率图，各出全部与分 stage 两张（--extra-figures 另出整夜频谱、HRV、stage 差异；--plot-only DIR 只重画），只读
 ```
 
+**分期替换实验：每折一个生成器（`scripts/make_fold_configs.py`，分类部分在 [ibi-sleep-staging](https://github.com/TUTUisAbigCAT/ibi-sleep-staging)）：**
+
+- 第 k 折的分类器在这一折的 test 参与者上测试，所以第 k 折的生成器不能见过他们。`make_fold_configs.py` 读 ibi-sleep-staging 的 `folds.json`（只读），以 `configs/ppg50.json`（N1/N2 分开，300 epoch）为基础，每折写一份 `fold<k>.json`（`exclude_subjects` = 这一折的 test 参与者，其余不变）和 `fold<k>_train.txt`（这一折分类器的训练参与者，也就是要用这个生成器生成的整夜）；已有的文件不覆盖。
+- `submit_train_ppg.sh RUN_DIR CONFIG`：`RUN_DIR` 还没有开始时用 `CONFIG` 新建，已经开始后同一条命令接着训练（用 run 自己的 `config.json`），所以每折可以一次排好 4 段；训完后多出来的那段会直接结束。
+- 每折只生成训练参与者的整夜，再用与真实 IBI 相同的 `ppg_nights_to_ibi.py`（`elgendi_local_fix`）转 IBI，得到 `nights/ppg50n1n2_fold<k>_best/ibi_elgendi_local_fix/night_npz`，即 ibi-sleep-staging `make_replacement_sets.py --generated` 的输入。
+
+```bash
+python scripts/make_fold_configs.py      # 默认读 /home/yxtao/links/scratch/ibi-sleep-staging/folds.json，写到 $C
+C=/home/yxtao/links/scratch/dataset-generation-ppg50/fold_configs
+for k in 0 1 2 3 4; do python -B scripts/train_ppg.py --config $C/fold$k.json --check-only > $C/fold${k}_check.txt && echo "fold $k ok"; done   # 登录节点检查：每折都要 ok（验证集够 8 人）；skipped_subjects 里是这一折的 test 参与者
+RUNS=/home/yxtao/links/scratch/dataset-generation-ppg50/runs
+for k in 0 1 2 3 4; do                   # 5 个生成器，各排 4 段（每段 3.5 小时）
+  R=$RUNS/ppg50n1n2_fold$k
+  J=$(sbatch --parsable submit_train_ppg.sh $R $C/fold$k.json)
+  for i in 1 2 3; do J=$(sbatch --parsable --dependency=afterany:$J submit_train_ppg.sh $R $C/fold$k.json); done
+done
+# 某一折训完（RUN_DIR/status.json 为 completed）后：生成这一折训练参与者的整夜（排两段，没做完的人会接着做），再转 IBI
+k=0; R=$RUNS/ppg50n1n2_fold$k
+J=$(sbatch --parsable submit_generate_ppg_nights.sh $R best best.pt --subjects $(cat $C/fold${k}_train.txt))
+sbatch --dependency=afterany:$J submit_generate_ppg_nights.sh $R best best.pt --subjects $(cat $C/fold${k}_train.txt)
+python scripts/ppg_nights_to_ibi.py --nights /home/yxtao/links/scratch/dataset-generation-ppg50/nights/ppg50n1n2_fold${k}_best --workers $(nproc)
+```
+
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）
 
 本仓库从 dataset-generation-v2（`3aaea1b`）分出，只做三件事，**原始数据和已有 NPZ 不改**，归一化与缺失值策略沿用推荐配置（`preserve`，0–2 s 线性映射到 [−1, 1]）：
