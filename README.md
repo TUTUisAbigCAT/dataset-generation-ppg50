@@ -83,13 +83,13 @@ python scripts/analyze_ppg_quality.py OUT [OUT2 ...] --labels e050 e146         
 python scripts/ppg_nights_to_ibi.py --nights OUT --workers $(nproc)                    # 已生成的 PPG（和真实 PPG）逐窗口转 IBI 并比较，不用 GPU；另写 WatchSleepNet 格式整夜文件
 python scripts/ibi_kde_spectrum.py --ibi OUT/ibi_elgendi_local_fix --workers $(nproc)    # 上一步的 IBI：IBI 的 KDE、FFT 频谱、心率图，各出全部与分 stage 两张（--extra-figures 另出整夜频谱、HRV、stage 差异；--plot-only DIR 只重画），只读
 
-# stage 替换实验（5 折；生成器 N1/N2 分开；WatchSleepNet 只在 DREAMT 上从头训练）
+# stage 替换实验（5 折；生成器 N1/N2 分开；MambaSleepNet 只在 DREAMT 上从头训练）
 python scripts/summarize_sync.py                     # E4 与 PSG 是否同步：提取报告里的逐拍 PPG-ECG 延迟，只读
 python scripts/make_folds.py                         # 按人分 5 折（平衡 AHI 与深睡），每折一个生成器配置 fold<k>.json
 sbatch submit_train_fold.sh D/fold0.json D/runs/ppg50n1n2_fold0    # 每折训练生成器（不含该折测试者），可排队续跑
 sbatch submit_generate_ppg_nights.sh D/runs/ppg50n1n2_fold0 best   # 再 ppg_nights_to_ibi.py：该折训练者的生成 IBI
 python scripts/make_replacement_sets.py --folds D/folds.json --real REAL_NIGHTS --generated "GEN/{fold}" --output-dir D/sets
-sbatch submit_watchsleepnet_folds.sh WSN_MODELING D/folds.json D/sets D/wsn_results ARM SEED   # 每个 arm、seed 一个 job
+sbatch submit_mambasleepnet_folds.sh MAMBA_MODELING D/folds.json D/sets D/mamba_results ARM SEED   # MambaSleepNet（只用 CE，无对比学习），每个 arm、seed 一个 job
 ```
 
 ## 30 秒窗口 + 呼吸事件条件（dataset-generation-30s-apnea）

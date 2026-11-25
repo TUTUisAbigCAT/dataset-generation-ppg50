@@ -1,4 +1,4 @@
-r"""WatchSleepNet datasets for the stage-replacement experiment: real nights with chosen epochs swapped.
+r"""Sleep-staging datasets for the stage-replacement experiment: real nights with chosen epochs swapped.
 
   python scripts/make_replacement_sets.py --folds FOLDS/folds.json --real REAL_NIGHTS \
       --generated "NIGHTS/ppg50n1n2_fold{fold}_best/ibi_elgendi_local_fix/night_npz" --output-dir OUT \
@@ -9,7 +9,7 @@ real PPG through the same per-window PPG -> IBI route). --generated is each fold
 that fold's generator ({fold} is replaced by the fold number); it must cover the fold's training participants.
 
 For every arm and fold, OUT/<arm>/fold<k>/ gets one NPZ per participant of the fold:
-  * WatchSleepNet training participants (folds.json "train"): the real night with the chosen epochs replaced;
+  * the classifier's training participants (folds.json "train"): the real night with the chosen epochs replaced;
   * validation and test participants: the real night, untouched (a symbolic link).
 Arms (the label never changes, only the 30-s IBI window):
   real                 nothing replaced (the baseline)

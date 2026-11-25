@@ -7,10 +7,10 @@ AHI/BMI/AGE/GENDER in participant_info.csv). They are split into K folds balance
 `--deep-epochs` N3 epochs, default 10 = 5 min) and on AHI: within each of the two groups, participants
 sorted by AHI are dealt in blocks of K, each block in random order to the folds with the fewest members.
 In every fold, `--val-fraction` of all participants (default 0.1) are taken from the training side, the
-same way, as WatchSleepNet's validation participants.
+same way, as the sleep-staging classifier's validation participants.
 
 Output in --output-dir (default <output_root>/../folds<K>_n1n2, never overwritten):
-  folds.json        per fold: test (all real), val and train (WatchSleepNet), generator_train = train + val;
+  folds.json        per fold: test (all real), val and train (classifier), generator_train = train + val;
                     per participant: AHI, deep epochs, fold
   fold<k>.json      the training config of fold k's generator: --config with stage_condition "n1n2",
                     exclude_subjects = fold k's test participants, training.epochs = --epochs (default 150)
