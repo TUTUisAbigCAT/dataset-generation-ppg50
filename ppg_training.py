@@ -439,6 +439,7 @@ def validation_metrics(generated, real, owners, config, *, missing_penalty_ms=20
 def _without_epochs(config):
     config = copy.deepcopy(config)
     config["training"].pop("epochs", None)
+    config.setdefault("stage_condition", "light")        # a run saved before the key existed used "light"
     return config
 
 

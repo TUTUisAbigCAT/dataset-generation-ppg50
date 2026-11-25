@@ -262,6 +262,21 @@ class TrainingTests(unittest.TestCase):
         self.assertTrue(all(np.isfinite(float(r["ibi_w1_ms"])) for r in rows))
         with np.load(out / "validation" / "epoch_003.npz") as saved:
             self.assertEqual(saved["generated"].shape, (4, 1500))
+        # a run saved before stage_condition existed (like ppg50_1393726) still continues, as "light"
+        import torch
+        legacy = self.folder / "legacy"
+        import shutil
+        shutil.copytree(out, legacy)
+        saved_config = json.loads((legacy / "config.json").read_text())
+        saved_config.pop("stage_condition", None)
+        (legacy / "config.json").write_text(json.dumps(saved_config))
+        state = torch.load(legacy / "state.pt", map_location="cpu", weights_only=False)
+        state["config"].pop("stage_condition", None)
+        torch.save(state, legacy / "state.pt")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            longer = train_ppg.main(["--resume", str(legacy), "--epochs", "4", "--device", "cpu", "--allow-cpu"])
+        self.assertEqual(longer["status"], "completed")
+        self.assertEqual(longer["epoch"], 4)
         summary = json.loads((out / "run_summary.json").read_text())
         self.assertNotIn("S092", summary["validation_subjects"])
         self.assertEqual(summary["training_subjects"], 6)                       # validation is not held out
