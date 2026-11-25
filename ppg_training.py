@@ -6,8 +6,10 @@ EMA for evaluation, and the DDPM reverse step with the posterior standard deviat
 
   * data: one window = `window_epochs` consecutive 30-s epochs of the stored 50 Hz PPG (1500 samples
     per epoch); by default only epochs with epoch_ok (teacher's step 4) are used;
-  * channels: PPG, stage one-hot (W, Light = N1+N2, REM, Deep), AHI/BMI/AGE z-scores, gender F/M and,
-    optionally, a 0/1 respiratory-event channel per sample (any of the four DREAMT event columns);
+  * channels: PPG, stage one-hot, AHI/BMI/AGE z-scores, gender F/M and, optionally, a 0/1
+    respiratory-event channel per sample (any of the four DREAMT event columns). The stage one-hot is
+    W, Light = N1+N2, REM, Deep with stage_condition "light" (the default, and what a checkpoint without
+    the key used) or W, N1, N2, REM, Deep with "n1n2";
   * normalization: per window, PPG minus its median divided by half its 1-99 % range, clipped to
     +-3 (wrist BVP amplitude is arbitrary; the PPG -> IBI path is scale invariant);
   * checkpoint selection: several validation participants (S092 is never one of them by default),
@@ -35,6 +37,9 @@ FS = px.FS_PPG
 EPOCH_SAMPLES = px.EPOCH_PPG
 STAGE_NAMES = ("W", "Light", "REM", "Deep")
 STAGE_TO_CLASS = np.array([0, 1, 1, 3, 2], dtype=np.int64)       # W, N1, N2, N3, R -> W, Light, Light, Deep, REM
+# stage one-hot layouts: names in channel order, and extraction code (W, N1, N2, N3, R) -> channel
+STAGE_LAYOUTS = dict(light=(STAGE_NAMES, STAGE_TO_CLASS),
+                     n1n2=(("W", "N1", "N2", "REM", "Deep"), np.array([0, 1, 2, 4, 3], dtype=np.int64)))
 CONTINUOUS = ("AHI", "BMI", "AGE")
 BASE_CHANNELS = ("PPG",) + tuple("stage_" + s for s in STAGE_NAMES) + CONTINUOUS + ("gender_F", "gender_M")
 APNEA_CHANNEL = "apnea_event"
@@ -46,6 +51,7 @@ DEFAULTS = dict(
     exclude_subjects=[],
     epoch_filter="epoch_ok",
     window_epochs=1,
+    stage_condition="light",
     apnea_condition=True,
     normalization=dict(low_percentile=1.0, high_percentile=99.0, clip=3.0),
     validation=dict(subjects=None, n_subjects=8, never=["S092"], windows_per_subject=32, batch_size=64,
@@ -85,6 +91,8 @@ def load_config(path=None, overrides=None):
         config = _merge(config, overrides)
     if config["epoch_filter"] not in ("epoch_ok", "all"):
         raise ValueError("epoch_filter must be 'epoch_ok' or 'all'")
+    if config["stage_condition"] not in STAGE_LAYOUTS:
+        raise ValueError(f"stage_condition must be one of {sorted(STAGE_LAYOUTS)}")
     if not isinstance(config["window_epochs"], int) or config["window_epochs"] < 1:
         raise ValueError("window_epochs must be a positive integer")
     t = config["training"]
@@ -96,8 +104,15 @@ def load_config(path=None, overrides=None):
     return config
 
 
+def stage_layout(config):
+    """(stage names in channel order, extraction code -> channel); a config without the key is "light"."""
+    return STAGE_LAYOUTS[config.get("stage_condition", "light")]
+
+
 def channel_names(config):
-    return BASE_CHANNELS + ((APNEA_CHANNEL,) if config["apnea_condition"] else ())
+    names, _ = stage_layout(config)
+    return (("PPG",) + tuple("stage_" + s for s in names) + CONTINUOUS + ("gender_F", "gender_M")
+            + ((APNEA_CHANNEL,) if config["apnea_condition"] else ()))
 
 
 def window_samples(config):
@@ -199,13 +214,15 @@ class PpgCohort:
         channels = channel_names(self.config)
         array = np.empty((length, len(channels)), dtype=np.float32)
         array[:, 0] = normalize_window(r["ppg"][first:first + count].reshape(-1), self.config["normalization"])
-        stage = STAGE_TO_CLASS[np.repeat(r["stages"][first:first + count], EPOCH_SAMPLES)]
-        array[:, 1:5] = np.eye(4, dtype=np.float32)[stage]
-        array[:, 5:8] = (r["continuous"] - np.asarray(self.scaler["mean"])) / np.asarray(self.scaler["std"])
-        array[:, 8] = float(r["gender"] == "F")
-        array[:, 9] = float(r["gender"] == "M")
+        names, to_channel = stage_layout(self.config)
+        k = len(names)
+        stage = to_channel[np.repeat(r["stages"][first:first + count], EPOCH_SAMPLES)]
+        array[:, 1:1 + k] = np.eye(k, dtype=np.float32)[stage]
+        array[:, 1 + k:4 + k] = (r["continuous"] - np.asarray(self.scaler["mean"])) / np.asarray(self.scaler["std"])
+        array[:, 4 + k] = float(r["gender"] == "F")
+        array[:, 5 + k] = float(r["gender"] == "M")
         if self.config["apnea_condition"]:
-            array[:, 10] = r["apnea"][first:first + count].reshape(-1)
+            array[:, 6 + k] = r["apnea"][first:first + count].reshape(-1)
         return array
 
 

@@ -5,6 +5,7 @@
   "exclude_subjects": [],
   "epoch_filter": "epoch_ok",
   "window_epochs": 1,
+  "stage_condition": "n1n2",
   "apnea_condition": true,
   "normalization": {"low_percentile": 1.0, "high_percentile": 99.0, "clip": 3.0},
   "validation": {
@@ -19,7 +20,7 @@
     "min_epoch_ok_fraction": 0.95,
     "max_abs_lag_s": 3.0
   },
-  "training": {"epochs": 50, "batch_size": 32, "lr": 0.0001, "ema_decay": 0.9999, "s4_dropout": 0.03,
+  "training": {"epochs": 300, "batch_size": 32, "lr": 0.0001, "ema_decay": 0.9999, "s4_dropout": 0.03,
                "seed": 42, "num_workers": 4, "log_every": 200},
   "model": {"num_res_layers": 4, "res_channels": 64, "skip_channels": 64, "s4_dstate": 64,
             "diff_step_embed_in": 32, "diff_step_embed_mid": 64, "diff_step_embed_out": 64},
