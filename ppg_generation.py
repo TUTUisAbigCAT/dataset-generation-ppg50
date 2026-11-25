@@ -62,6 +62,8 @@ def load_generator(checkpoint_path, device):
     config = weights["config"]
     if config["window_epochs"] != 1:
         raise ValueError("Night generation supports models with window_epochs = 1")
+    if list(pt.channel_names(config)) != list(weights["channels"]):
+        raise ValueError(f"{checkpoint_path}: stored channels {weights['channels']} do not match its configuration")
     model = pt.build_model(config, len(weights["channels"]))
     model.load_state_dict(weights["ema"] if weights.get("ema") is not None else weights["model"])
     return model.to(device).eval(), weights

@@ -108,6 +108,31 @@ class NightGenerationTests(unittest.TestCase):
             target = plot_ppg_quality.main([str(out)])
         self.assertTrue(Path(target).is_file())
 
+    def test_n1n2_fold_run_generates_only_its_training_participants(self):
+        from test_ppg_training import tiny_config
+        from scripts import generate_ppg_nights, train_ppg
+
+        data = self.folder / "ppg"
+        config = tiny_config(data, self.folder / "participant_info.csv", self.folder / "runs",
+                             stage_condition="n1n2", exclude_subjects=["S005"])
+        path = self.folder / "tiny_n1n2.json"
+        path.write_text(json.dumps(config))
+        run = self.folder / "run_n1n2"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            train_ppg.main(["--config", str(path), "--output-dir", str(run), "--device", "cpu", "--allow-cpu"])
+            out = self.folder / "nights_n1n2"
+            args = ["--run", str(run), "--output-dir", str(out), "--device", "cpu", "--allow-cpu", "--batch-size", "8"]
+            check = generate_ppg_nights.main(args + ["--check-only"])
+            done = generate_ppg_nights.main(args + ["--subjects", "S001"])
+        self.assertEqual(check["subjects"], 5)                                    # the test participant is left out
+        self.assertEqual(done["status"], "completed")
+        import torch
+        weights = torch.load(run / "best.pt", map_location="cpu", weights_only=False)
+        self.assertEqual(len(weights["channels"]), 12)
+        self.assertIn("stage_N1", weights["channels"])
+        with np.load(out / "subjects" / "S001.npz") as z:
+            self.assertEqual(z["generated_ppg"].shape, (14, 1500))
+
     def test_nights_metrics_resume_and_frozen_checkpoint(self):
         out = self.folder / "nights"
         check = self.generate(out, "--check-only", "--ibi")
