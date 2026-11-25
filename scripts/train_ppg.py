@@ -95,9 +95,13 @@ def main(argv=None):
     if cli.check_only:
         import torch
 
-        model = pt.build_model(config, len(trainer.channels))
-        window = torch.from_numpy(trainer.cohort.window_array(*trainer.training_windows[0]))[None]
-        out = model(window, torch.zeros(1, 1, dtype=torch.long))
+        # the upstream step embedding (utils/util.py) goes to CUDA whenever CUDA is available, as on the
+        # GPU login node: the shape check runs on that device too
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = pt.build_model(config, len(trainer.channels)).to(device)
+        window = torch.from_numpy(trainer.cohort.window_array(*trainer.training_windows[0]))[None].to(device)
+        with torch.no_grad():
+            out = model(window, torch.zeros(1, 1, dtype=torch.long, device=device))
         parameters = sum(p.numel() for p in model.parameters())
         print(json.dumps(dict(status="check_passed", output_directory=str(output), model_parameters=parameters,
                               model_output_shape=list(out.shape),
