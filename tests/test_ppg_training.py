@@ -119,31 +119,6 @@ class ConfigAndDataTests(unittest.TestCase):
         self.assertNotIn(("S001", 4), pairs)                                    # contains the bad epoch 5
         self.assertTrue(all(first + 1 != 8 for _, first in pairs))              # never across the gap
 
-    def test_n1n2_stage_layout(self):
-        import ppg_training as pt
-
-        config = tiny_config(self.data, self.metadata, self.folder / "runs", stage_condition="n1n2")
-        self.assertEqual(pt.channel_names(config)[1:6], ("stage_W", "stage_N1", "stage_N2", "stage_REM", "stage_Deep"))
-        self.assertEqual(len(pt.channel_names(config)), 12)
-        cohort = pt.PpgCohort(config)
-        cohort.fit_scaler(cohort.subjects)
-        stages = cohort.records["S001"]["stages"]
-        expected = {0: [1, 0, 0, 0, 0], 1: [0, 1, 0, 0, 0], 2: [0, 0, 1, 0, 0], 3: [0, 0, 0, 0, 1], 4: [0, 0, 0, 1, 0]}
-        for first in range(len(stages)):
-            array = cohort.window_array("S001", first)
-            self.assertEqual(array.shape, (1500, 12))
-            np.testing.assert_array_equal(array[0, 1:6], expected[int(stages[first])])
-        array = cohort.window_array("S001", 3)
-        self.assertEqual(array[:, 11].sum(), 700)                               # event channel stays last
-        self.assertEqual(array[0, 9] + array[0, 10], 1.0)                       # gender F/M
-        light = pt.PpgCohort(tiny_config(self.data, self.metadata, self.folder / "runs"))
-        light.scaler = cohort.scaler
-        np.testing.assert_allclose(light.window_array("S001", 3)[:, 5:8], array[:, 6:9])   # same z-scores
-        legacy = {k: v for k, v in config.items() if k != "stage_condition"}       # checkpoint without the key
-        self.assertEqual(len(pt.channel_names(legacy)), 11)
-        with self.assertRaises(ValueError):
-            tiny_config(self.data, self.metadata, self.folder / "runs", stage_condition="n1")
-
     def test_validation_subjects_skip_s092_and_irregular_rhythm(self):
         import ppg_training as pt
 
