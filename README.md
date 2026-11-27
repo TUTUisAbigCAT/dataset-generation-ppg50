@@ -82,6 +82,7 @@ python scripts/plot_ppg_quality.py OUT                                          
 python scripts/analyze_ppg_quality.py OUT [OUT2 ...] --labels e050 e146               # 全体 + 按分期（W/N1/N2/Light/Deep/REM）：分布、质量分档、同一 epoch 一致性、C2ST AUC
 python scripts/ppg_nights_to_ibi.py --nights OUT --workers $(nproc)                    # 已生成的 PPG（和真实 PPG）逐窗口转 IBI 并比较，不用 GPU；另写 WatchSleepNet 格式整夜文件
 python scripts/ibi_kde_spectrum.py --ibi OUT/ibi_elgendi_local_fix --workers $(nproc)    # 上一步的 IBI：IBI 的 KDE、FFT 频谱、心率图，各出全部与分 stage 两张（--extra-figures 另出整夜频谱、HRV、stage 差异；--plot-only DIR 只重画），只读
+python scripts/ibi_kde_spectrum.py --ibi OUT/ibi_elgendi_local_fix --workers $(nproc) --stages 4   # 同上，按分类器的四类 W / Light (N1+N2) / Deep / REM，输出在 kde_spectrum_4stages，不覆盖五类的结果
 ```
 
 **分期替换实验：每折一个生成器（`scripts/make_fold_configs.py`，分类部分在 [ibi-sleep-staging](https://github.com/TUTUisAbigCAT/ibi-sleep-staging)）：**

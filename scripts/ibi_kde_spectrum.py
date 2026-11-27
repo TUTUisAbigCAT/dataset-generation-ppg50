@@ -2,6 +2,7 @@ r"""KDE, spectrum, heart rate and HRV of real vs generated IBI, overall and per 
 
   python scripts/ibi_kde_spectrum.py --ibi NIGHTS/ibi_elgendi_local_fix [--output-dir DIR] [--workers N]
   python scripts/ibi_kde_spectrum.py --plot-only DIR          # re-draw the figures from DIR's CSV/JSON only
+  ... --stages 4    W, Light (N1 + N2), Deep and REM, as the classifier's four classes, in IBI/kde_spectrum_4stages
 
 Reads IBI_DIR/subjects/S*.npz from scripts/ppg_nights_to_ibi.py: the 25 Hz IBI (s) of every 30-s window,
 generated and real (both from PPG through the same route), the sample status (0 measured, 1 filled,
@@ -53,8 +54,20 @@ import numpy as np
 FS = 25
 EPOCH = 750
 MEASURED = 0
-STAGES = (("W", 0), ("N1", 1), ("N2", 2), ("Deep", 3), ("REM", 4))
+STAGE_SETS = {"5": (("W", 0), ("N1", 1), ("N2", 2), ("Deep", 3), ("REM", 4)),
+              "4": (("W", 0), ("Light", 1), ("Deep", 3), ("REM", 4))}    # 4: N2 windows counted as Light (code 1)
+BASE_STAGES = {"5": "N2", "4": "Light"}                                  # the stage the contrasts compare against
+STAGES = STAGE_SETS["5"]
 GROUPS = ("ALL",) + tuple(name for name, _ in STAGES)
+BASE_STAGE = BASE_STAGES["5"]
+
+
+def use_stages(key):
+    """Stage set for this process: "5" (W, N1, N2, Deep, REM) or "4" (W, Light = N1 + N2, Deep, REM)."""
+    global STAGES, GROUPS, BASE_STAGE
+    STAGES = STAGE_SETS[key]
+    GROUPS = ("ALL",) + tuple(name for name, _ in STAGES)
+    BASE_STAGE = BASE_STAGES[key]
 NIGHT_BANDS = dict(VLF=(0.0033, 0.04), LF=(0.04, 0.15), HF=(0.15, 0.4))
 LF, HF = (0.04, 0.15), (0.15, 0.4)
 NPERSEG = 15000                     # 10 min at 25 Hz
@@ -76,6 +89,8 @@ def parse_args(argv=None):
     parser.add_argument("--subjects", nargs="*")
     parser.add_argument("--exclude", nargs="*", default=[], help="participants to leave out")
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--stages", choices=sorted(STAGE_SETS), default="5",
+                        help="5: W, N1, N2, Deep, REM (default); 4: W, Light (N1 + N2), Deep, REM")
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument("--extra-figures", action="store_true",
                         help="also the detailed figures (night spectrum, HR/HRV by stage, stage contrasts)")
@@ -188,12 +203,15 @@ def stage_metrics(ibi, status, rows, frequency=None, psd=None):
 
 
 def analyze_subject(task):
-    sid, folder = task
+    sid, folder, stage_set = task if len(task) == 3 else (*task, "5")
+    use_stages(stage_set)
     with np.load(Path(folder) / "subjects" / f"{sid}.npz") as z:
         data = dict(gen=(z["ibi_generated"].astype(np.float64), z["ibi_generated_status"]),
                     real=(z["ibi_real"].astype(np.float64), z["ibi_real_status"]))
         stages = z["stages"].astype(np.int64)
         epoch_index = z["epoch_index"].astype(np.int64)
+    if stage_set == "4":
+        stages = np.where(stages == 2, 1, stages)                     # N1 and N2 together as Light
     valid_fraction = {s: (data[s][0] > 0).mean(axis=1) for s in SOURCES}
     paired = (valid_fraction["gen"] >= MIN_VALID) & (valid_fraction["real"] >= MIN_VALID)
     result = dict(subject=sid, epochs=int(len(stages)), paired_windows=int(paired.sum()), metrics={}, pooled={},
@@ -289,13 +307,14 @@ def table(results, group, source, metric):
 def contrast(results, stage, metric):
     out = {}
     for source in SOURCES:
-        value, base = table(results, stage, source, metric), table(results, "N2", source, metric)
+        value, base = table(results, stage, source, metric), table(results, BASE_STAGE, source, metric)
         out[source] = 10 * np.log10(value / base) if metric in LOG_METRICS else value - base
     return out
 
 
 def summarize(results, pooled, args, ibi_dir):
     summary = dict(participants=len(results), ibi_dir=str(ibi_dir), excluded=sorted(args.exclude),
+                   stage_set=args.stages, stages=[name for name, _ in STAGES], contrast_base=BASE_STAGE,
                    windows={g: int(sum(r["windows"][g] for r in results)) for g in GROUPS},
                    peak_method=None, kde={}, night_spectrum={}, window_spectrum={}, stage_metrics={},
                    stage_contrasts={}, settings=dict(kde_samples_per_second=FS // KDE_STEP, kde_sigma="0.03 x SD real",
@@ -324,7 +343,7 @@ def summarize(results, pooled, args, ibi_dir):
             participants=int(np.isfinite(table(results, group, "real", "hf_ms2")).sum()),
             windows=int(np.nansum(table(results, group, "real", "spectrum_windows"))))
     for stage, _ in STAGES:
-        if stage == "N2":
+        if stage == BASE_STAGE:
             continue
         summary["stage_contrasts"][stage] = {m: contrast_summary(*(contrast(results, stage, m)[s] for s in SOURCES))
                                              for m in ("hr_bpm", "rmssd_ms", "hf_ms2", "lf_hf")}
@@ -423,7 +442,7 @@ def simple_figures(output):
                          "axes.titlesize": 11, "axes.labelcolor": INK, "xtick.color": INK, "ytick.color": INK,
                          "axes.axisbelow": True})
     n = summary["participants"]
-    stages = [name for name, _ in STAGES]
+    stages = summary.get("stages") or [name for name, _ in STAGE_SETS["5"]]    # a summary from before --stages: 5
     series = (("real", REAL_COLOR, "Real", 2.0), ("gen", GEN_COLOR, "Generated", 1.8))
 
     def kde_panel(ax, group, variable, key, unit, limits, label):
@@ -667,9 +686,9 @@ def detail_figures(output, results, pooled, summary):
     fig.savefig(output / "stage_hr_hrv.png", dpi=160)
     plt.close(fig)
 
-    # stage contrasts against N2, per participant
-    others = [name for name in names if name != "N2"]
-    rows = (("hr_bpm", "heart rate, stage - N2 (bpm)"), ("hf_ms2", "HF power, stage / N2 (dB)"))
+    # stage contrasts against N2 (Light with --stages 4), per participant
+    others = [name for name in names if name != BASE_STAGE]
+    rows = (("hr_bpm", f"heart rate, stage - {BASE_STAGE} (bpm)"), ("hf_ms2", f"HF power, stage / {BASE_STAGE} (dB)"))
     fig, axes = plt.subplots(len(rows), len(others), figsize=(3.6 * len(others), 7.4))
     for i, (metric, label) in enumerate(rows):
         for j, stage in enumerate(others):
@@ -726,7 +745,7 @@ def print_summary(summary):
             r = "  -  " if s["r"] is None else f"{s['r']:.2f}"
             print(f"    {group:5s} {s['real_median']:9.2f} / {s['gen_median']:<9.2f} diff {s['median_diff']:+8.2f}"
                   f"  p {p:>8s}  r {r}  n {s['participants']}")
-    print("\nstage - N2 contrasts per participant: median real / generated, same sign, r")
+    print(f"\nstage - {BASE_STAGE} contrasts per participant: median real / generated, same sign, r")
     for stage, metrics in summary["stage_contrasts"].items():
         for metric, s in metrics.items():
             if "same_sign" in s:
@@ -741,8 +760,10 @@ def main(argv=None):
         written = simple_figures(args.plot_only.expanduser().resolve())
         print("written:", ", ".join(written))
         return None
+    use_stages(args.stages)
     ibi_dir = args.ibi.expanduser().resolve()
-    output = (args.output_dir or ibi_dir / "kde_spectrum").expanduser().resolve()
+    default_name = "kde_spectrum" if args.stages == "5" else "kde_spectrum_4stages"
+    output = (args.output_dir or ibi_dir / default_name).expanduser().resolve()
     sids = sorted(p.stem for p in (ibi_dir / "subjects").glob("S*.npz"))
     if args.subjects:
         sids = [s for s in sids if s in set(args.subjects)]
@@ -750,7 +771,7 @@ def main(argv=None):
     if not sids:
         raise SystemExit(f"No participants in {ibi_dir / 'subjects'}")
     output.mkdir(parents=True, exist_ok=True)
-    tasks = [(sid, str(ibi_dir)) for sid in sids]
+    tasks = [(sid, str(ibi_dir), args.stages) for sid in sids]
     if args.workers > 1:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             results = list(pool.map(analyze_subject, tasks))

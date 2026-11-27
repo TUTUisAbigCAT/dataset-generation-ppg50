@@ -75,6 +75,51 @@ class IbiKdeSpectrumTest(unittest.TestCase):
             kde = summary["kde"]["ALL"]["ibi_ms"]
             self.assertGreater(kde["w1"], 0)
 
+    def test_four_stage_set_merges_n1_and_n2(self):
+        import csv
+        import json
+        from scripts import ibi_kde_spectrum as ks
+
+        rng = np.random.default_rng(2)
+        stages = np.array([0] * 4 + [1] * 6 + [2] * 30 + [3] * 10 + [4] * 6 + [2] * 10)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "ibi"
+            (folder / "subjects").mkdir(parents=True)
+            for sid in ("S001", "S002", "S003"):
+                real = windows(stages, {0: 70, 1: 64, 2: 60, 3: 54, 4: 66}, 0.05, rng)
+                gen = windows(stages, {0: 70, 1: 64, 2: 60, 3: 60, 4: 66}, 0.0, rng)
+                np.savez_compressed(folder / "subjects" / f"{sid}.npz", ibi_generated=gen[0],
+                                    ibi_generated_status=gen[1], ibi_real=real[0], ibi_real_status=real[1],
+                                    epoch_ok_generated=gen[2], epoch_ok_real=real[2], stages=stages,
+                                    epoch_index=np.arange(len(stages)), apnea_25hz=np.zeros((len(stages), 750), np.uint8),
+                                    peak_method=np.array("elgendi_local_fix"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                five = ks.main(["--ibi", str(folder), "--workers", "2"])
+                four = ks.main(["--ibi", str(folder), "--workers", "2", "--stages", "4", "--extra-figures"])
+            self.assertEqual(five["stages"], ["W", "N1", "N2", "Deep", "REM"])
+            self.assertEqual(four["stages"], ["W", "Light", "Deep", "REM"])
+            self.assertEqual(four["windows"]["Light"], five["windows"]["N1"] + five["windows"]["N2"])
+            for name in ("ALL", "W", "Deep", "REM"):
+                self.assertEqual(four["windows"][name], five["windows"][name])
+                self.assertEqual(four["kde"][name], five["kde"][name])        # untouched stages unchanged
+            self.assertEqual(sorted(four["stage_contrasts"]), ["Deep", "REM", "W"])   # against Light
+            out = folder / "kde_spectrum_4stages"
+            self.assertTrue((folder / "kde_spectrum" / "kde_curves.csv").is_file())  # the 5-stage output stays
+            with open(out / "kde_curves.csv") as stream:
+                groups = {row["group"] for row in csv.DictReader(stream)}
+            self.assertEqual(groups, {"ALL", "W", "Light", "Deep", "REM"})
+            with open(out / "psd_stage.csv") as stream:
+                spectra = {row["stage"] for row in csv.DictReader(stream)}
+            self.assertEqual(spectra, {"ALL", "Light", "Deep", "REM"})        # W: 4 windows, under MIN_WINDOWS
+            self.assertEqual(json.loads((out / "kde_spectrum_summary.json").read_text())["stage_set"], "4")
+            for kind in ("kde_ibi", "fft", "hr"):
+                (out / f"fig_{kind}_stages.png").unlink()
+            with contextlib.redirect_stdout(io.StringIO()):
+                ks.main(["--plot-only", str(out)])                            # stage names come from the summary
+            for kind in ("kde_ibi", "fft", "hr"):
+                self.assertTrue((out / f"fig_{kind}_stages.png").is_file())
+            ks.use_stages("5")
+
     def test_rmssd_uses_successive_measured_intervals(self):
         from scripts import ibi_kde_spectrum as ks
 
