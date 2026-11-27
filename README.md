@@ -100,6 +100,7 @@ for k in 0 1 2 3 4; do                   # 5 个生成器，各排 4 段（每�
   J=$(sbatch --parsable submit_train_ppg.sh $R $C/fold$k.json)
   for i in 1 2 3; do J=$(sbatch --parsable --dependency=afterany:$J submit_train_ppg.sh $R $C/fold$k.json); done
 done
+python scripts/validation_by_stage.py $RUNS/ppg50n1n2_fold{0,1,2,3,4}   # 训练中或训练后（登录节点，只读）：按分期（W/N1/N2/Deep/REM）比较验证窗口的 W1、心率、SDNN、RMSSD，生成 vs 真实，写到新文件夹
 # 某一折训完（RUN_DIR/status.json 为 completed）后：生成这一折训练参与者的整夜（排两段，没做完的人会接着做），再转 IBI
 k=0; R=$RUNS/ppg50n1n2_fold$k
 J=$(sbatch --parsable submit_generate_ppg_nights.sh $R best best.pt --subjects $(cat $C/fold${k}_train.txt))
